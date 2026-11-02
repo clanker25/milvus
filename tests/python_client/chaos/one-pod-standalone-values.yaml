@@ -1,0 +1,34 @@
+metrics:
+  serviceMonitor:
+    enabled: false
+
+cluster:
+  enabled: false
+etcd:
+  enabled: false
+minio:
+  enabled: true
+  tls:
+    enabled: false
+pulsar:
+  enabled: false
+standalone:
+  resources:
+    limits:
+      cpu: 9
+      memory: 16Gi
+    requests:
+      cpu: 4
+      memory: 8Gi  
+  extraEnv:
+  - name: ETCD_CONFIG_PATH
+    value: /milvus/configs/advanced/etcd.yaml
+extraConfigFiles:
+  user.yaml: |+
+    etcd:
+      use:
+        embed: true
+      data:
+        dir: /var/lib/milvus/etcd
+    common:
+      storageType: local
