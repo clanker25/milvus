@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# Licensed to the LF AI & Data foundation under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Exit immediately for non zero status
+set -e
+# Print commands
+set -x
+
+# Absolute path to the toplevel milvus directory.
+toplevel=$(dirname "$(cd "$(dirname "${0}")"; pwd)")
+if [[ -f "$toplevel/.env" ]]; then
+    set -a  # automatically export all variables from .env
+    source $toplevel/.env
+    set +a  # stop automatically exporting
+fi
+
+OS_NAME="${OS_NAME:-ubuntu20.04}"
+MILVUS_IMAGE_REPO="${MILVUS_IMAGE_REPO:-milvusdb/milvus}"
+MILVUS_IMAGE_TAG="${MILVUS_IMAGE_TAG:-latest}"
+
+if [ -z "$IMAGE_ARCH" ]; then
+    MACHINE=$(uname -m)
+    if [ "$MACHINE" = "x86_64" ]; then
+        IMAGE_ARCH="amd64"
+    else
+        IMAGE_ARCH="arm64"
+    fi
+fi
+
+echo ${IMAGE_ARCH}
+
+source "${toplevel}/scripts/sanitizer_env.sh"
+milvus_sanitizer_env "${toplevel}"
+
+if [[ "$USE_ASAN" == "ON" ]]; then
+    if [[ "$OS_NAME" == "ubuntu20.04" ]]; then
+        BUILD_ARGS="${BUILD_ARGS:---build-arg TARGETARCH=${IMAGE_ARCH} --build-arg MILVUS_ASAN_LIB=/milvus/lib/libasan.so.6}"
+    elif [[ "$OS_NAME" == "ubuntu22.04" ]]; then
+        BUILD_ARGS="${BUILD_ARGS:---build-arg TARGETARCH=${IMAGE_ARCH} --build-arg MILVUS_ASAN_LIB=/milvus/lib/libasan.so.8}"
+    else
+        BUILD_ARGS="${BUILD_ARGS:---build-arg TARGETARCH=${IMAGE_ARCH}}"
+    fi
+else
+    BUILD_ARGS="${BUILD_ARGS:---build-arg TARGETARCH=${IMAGE_ARCH}}"
+fi
+
+if [[ "${MILVUS_ENABLE_TSAN}" == "ON" ]]; then
+    BUILD_ARGS="${BUILD_ARGS} --build-arg MILVUS_JEMALLOC_LIB="
+    if [[ -f "${toplevel}/lib/milvus-archer" ]]; then
+        python3 "${toplevel}/internal/core/milvus_tsan.py" verify "${toplevel}/lib"
+        python3 "${toplevel}/internal/core/milvus_tsan.py" verify-runtime "${toplevel}/lib"
+        BUILD_ARGS="${BUILD_ARGS} --build-arg MILVUS_ARCHER_LIB=/milvus/lib/libarcher.so --build-arg MILVUS_TSAN_OPTIONS=halt_on_error=1:exitcode=66:suppressions=/milvus/lib/tsan.supp:external_symbolizer_path=/milvus/lib/llvm-symbolizer"
+    fi
+fi
+
+pushd "${toplevel}"
+
+docker build --network host ${BUILD_ARGS} --platform linux/${IMAGE_ARCH} -f "./build/docker/milvus/${OS_NAME}/Dockerfile" -t "${MILVUS_IMAGE_REPO}:${MILVUS_IMAGE_TAG}" .
+
+image_size=$(docker inspect ${MILVUS_IMAGE_REPO}:${MILVUS_IMAGE_TAG}  -f '{{.Size}}'| awk '{ byte =$1 /1024/1024/1024; print byte " GB" }')
+
+echo "Image Size for  ${MILVUS_IMAGE_REPO}:${MILVUS_IMAGE_TAG} is ${image_size}"
+
+popd

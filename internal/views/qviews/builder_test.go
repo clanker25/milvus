@@ -1,0 +1,155 @@
+package qviews
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
+)
+
+func TestQueryViewBuilderOwnsPlacementCopy(t *testing.T) {
+	view := &viewpb.QueryViewOfShard{
+		Meta: &viewpb.QueryViewMeta{
+			CollectionId: 1, ReplicaId: 10, Vchannel: "v1", SchemaVersion: 7, LoadInfoVersion: 8,
+			Version: &viewpb.QueryViewVersion{DataVersion: &viewpb.DataVersion{StreamingVersion: 2}, QueryVersion: 3}, TransformStartAfterTimetick: 99,
+		},
+		QueryNode: []*viewpb.QueryViewOfQueryNode{{NodeId: 1, Partitions: []*viewpb.QueryViewOfPartition{
+			{PartitionId: 100, SegmentIds: []int64{101}, SegmentManifestVersions: []int64{5}},
+		}}},
+		StreamingNode: &viewpb.QueryViewOfStreamingNode{PartitionStats: []*viewpb.ClusteredPartitionStats{{PartitionId: 100, Version: 6}}},
+	}
+	b := NewQueryViewAtCoordBuilderFromView(view)
+	b.Assignments()[1][100][0] = 999
+	require.Equal(t, int64(101), view.QueryNode[0].Partitions[0].SegmentIds[0])
+	b = NewQueryViewAtCoordBuilderFromView(view)
+	b.SetAssignments(map[int64]map[int64][]int64{2: {100: {101}}})
+	result := b.Build()
+	require.Equal(t, []int64{5}, result.QueryNode[0].Partitions[0].SegmentManifestVersions)
+	require.Equal(t, int32(7), result.Meta.SchemaVersion)
+	require.Equal(t, uint64(8), result.Meta.LoadInfoVersion)
+	require.Equal(t, uint64(99), result.Meta.TransformStartAfterTimetick)
+	require.Equal(t, int64(6), result.StreamingNode.PartitionStats[0].Version)
+}
+
+func TestQueryViewAtCoordBuilder(t *testing.T) {
+	shardView := &viewpb.DataViewOfShard{
+		Vchannel: "v1",
+		Partitions: []*viewpb.DataViewOfPartition{
+			{PartitionId: 1, SegmentIds: []int64{100, 101, 102}},
+			{PartitionId: 2, SegmentIds: []int64{200, 201}},
+		},
+		GrowingTransformStartAfterTimetick:   12345,
+		CompactedTransformStartAfterTimetick: 12345,
+	}
+	dataView := &viewpb.DataViewOfCollection{
+		CollectionId:  10,
+		SchemaVersion: 7,
+		DataVersion:   &viewpb.DataVersion{StreamingVersion: 2, CompactVersion: 1},
+		Shards:        []*viewpb.DataViewOfShard{shardView},
+	}
+
+	loadInfoVersion := uint64(7)
+
+	assignments := map[int64]map[int64][]int64{
+		1001: {1: {100, 101}, 2: {201}},
+		1002: {1: {102}, 2: {200}},
+	}
+
+	result := NewQueryViewAtCoordBuilder(1, dataView, "v1").
+		SetQueryVersion(3).
+		SetLoadInfoVersion(loadInfoVersion).
+		SetAssignments(assignments).
+		Build()
+
+	assert.Equal(t, DataVersion{StreamingVersion: 2, CompactVersion: 1},
+		NewQueryViewAtCoordBuilder(1, dataView, "v1").DataVersion())
+
+	// Verify meta.
+	assert.Equal(t, int64(10), result.Meta.CollectionId)
+	assert.Equal(t, int64(1), result.Meta.ReplicaId)
+	assert.Equal(t, "v1", result.Meta.Vchannel)
+	assert.Equal(t, viewpb.QueryViewState_QueryViewStatePreparing, result.Meta.State)
+	assert.Equal(t, int64(2), result.Meta.Version.DataVersion.StreamingVersion)
+	assert.Equal(t, int64(1), result.Meta.Version.DataVersion.CompactVersion)
+	assert.Equal(t, int64(3), result.Meta.Version.QueryVersion)
+	assert.Equal(t, loadInfoVersion, result.Meta.LoadInfoVersion)
+	assert.EqualValues(t, 7, result.Meta.SchemaVersion)
+	assert.Equal(t, uint64(12345), result.Meta.TransformStartAfterTimetick)
+
+	// Verify query nodes are sorted by node ID.
+	assert.Len(t, result.QueryNode, 2)
+	assert.Equal(t, int64(1001), result.QueryNode[0].NodeId)
+	assert.Equal(t, int64(1002), result.QueryNode[1].NodeId)
+
+	// Verify node 1001: partition 1 → [100, 101], partition 2 → [201].
+	node1001 := result.QueryNode[0]
+	assert.Len(t, node1001.Partitions, 2)
+	assert.Equal(t, int64(1), node1001.Partitions[0].PartitionId)
+	assert.Equal(t, []int64{100, 101}, node1001.Partitions[0].SegmentIds)
+	assert.Equal(t, int64(2), node1001.Partitions[1].PartitionId)
+	assert.Equal(t, []int64{201}, node1001.Partitions[1].SegmentIds)
+
+	// Verify node 1002: partition 1 → [102], partition 2 → [200].
+	node1002 := result.QueryNode[1]
+	assert.Len(t, node1002.Partitions, 2)
+	assert.Equal(t, int64(1), node1002.Partitions[0].PartitionId)
+	assert.Equal(t, []int64{102}, node1002.Partitions[0].SegmentIds)
+	assert.Equal(t, int64(2), node1002.Partitions[1].PartitionId)
+	assert.Equal(t, []int64{200}, node1002.Partitions[1].SegmentIds)
+
+	// Verify streaming node is present.
+	assert.NotNil(t, result.StreamingNode)
+
+	// Verify SegmentIDs on the per-node view.
+	qv1001 := NewQueryViewAtWorkNodeFromProto(&viewpb.QueryViewOfShard{
+		Meta:      result.Meta,
+		QueryNode: []*viewpb.QueryViewOfQueryNode{node1001},
+	})
+	assert.ElementsMatch(t, []int64{100, 101, 201}, qv1001.(*QueryViewAtQueryNode).SegmentIDs())
+}
+
+func TestQueryViewAtCoordBuilder_Empty(t *testing.T) {
+	dataView := &viewpb.DataViewOfCollection{
+		CollectionId: 10,
+		DataVersion:  &viewpb.DataVersion{StreamingVersion: 1, CompactVersion: 0},
+		Shards:       []*viewpb.DataViewOfShard{{Vchannel: "v1"}},
+	}
+
+	result := NewQueryViewAtCoordBuilder(1, dataView, "v1").Build()
+
+	assert.Equal(t, int64(10), result.Meta.CollectionId)
+	assert.Equal(t, "v1", result.Meta.Vchannel)
+	assert.Equal(t, viewpb.QueryViewState_QueryViewStatePreparing, result.Meta.State)
+	assert.Len(t, result.QueryNode, 0)
+	assert.NotNil(t, result.StreamingNode)
+}
+
+func TestQueryViewAtCoordBuilder_MissingVChannelPanics(t *testing.T) {
+	dataView := &viewpb.DataViewOfCollection{
+		CollectionId: 10,
+		DataVersion:  &viewpb.DataVersion{StreamingVersion: 1, CompactVersion: 0},
+		Shards:       []*viewpb.DataViewOfShard{{Vchannel: "v1"}},
+	}
+
+	require.Panics(t, func() {
+		NewQueryViewAtCoordBuilder(1, dataView, "v2")
+	})
+}
+
+func TestQueryViewBuilderPreservesSegmentTransformStarts(t *testing.T) {
+	view := &viewpb.DataViewOfCollection{
+		CollectionId: 1,
+		DataVersion:  &viewpb.DataVersion{StreamingVersion: 1},
+		Shards: []*viewpb.DataViewOfShard{{
+			Vchannel:                             "v1",
+			GrowingTransformStartAfterTimetick:   40,
+			CompactedTransformStartAfterTimetick: 50,
+			Partitions:                           []*viewpb.DataViewOfPartition{{PartitionId: 1, SegmentIds: []int64{10, 20}, SegmentTransformStartAfterTimeticks: []uint64{50, 70}, SegmentManifestVersions: []int64{3, 4}}},
+		}},
+	}
+	result := NewQueryViewAtCoordBuilder(1, view, "v1").SetAssignments(map[int64]map[int64][]int64{100: {1: {20, 10}}}).Build()
+	require.Equal(t, uint64(40), result.Meta.TransformStartAfterTimetick)
+	require.Equal(t, []int64{4, 3}, result.QueryNode[0].Partitions[0].SegmentManifestVersions)
+}

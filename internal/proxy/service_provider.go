@@ -1,0 +1,355 @@
+package proxy
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+
+	"go.opentelemetry.io/otel"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util"
+	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/externalspec"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v3/util/timestamptz"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+type Request interface {
+	GetDbName() string
+	GetCollectionName() string
+}
+
+type Response interface {
+	GetStatus() *commonpb.Status
+}
+
+type ServiceInterceptor[Req Request, Resp Response] interface {
+	Call(ctx context.Context, request Req) (Resp, error)
+}
+
+func NewInterceptor[Req Request, Resp Response](proxy *Proxy, method string) (*InterceptorImpl[Req, Resp], error) {
+	var provider milvuspb.MilvusServiceServer
+	cached := paramtable.Get().ProxyCfg.EnableCachedServiceProvider.GetAsBool()
+	if cached {
+		provider = &CachedProxyServiceProvider{Proxy: proxy}
+	} else {
+		provider = &RemoteProxyServiceProvider{Proxy: proxy}
+	}
+	switch method {
+	case "DescribeCollection":
+		interceptor := &InterceptorImpl[*milvuspb.DescribeCollectionRequest, *milvuspb.DescribeCollectionResponse]{
+			proxy:      proxy,
+			method:     method,
+			onCall:     provider.DescribeCollection,
+			onResponse: finalizeDescribeCollectionResponse,
+			onError: func(err error) (*milvuspb.DescribeCollectionResponse, error) {
+				return &milvuspb.DescribeCollectionResponse{
+					Status: merr.Status(err),
+				}, nil
+			},
+		}
+		return interface{}(interceptor).(*InterceptorImpl[Req, Resp]), nil
+	default:
+		return nil, merr.WrapErrParameterInvalidMsg("method %s not supported", method)
+	}
+}
+
+type InterceptorImpl[Req Request, Resp Response] struct {
+	proxy      *Proxy
+	method     string
+	onCall     func(ctx context.Context, request Req) (Resp, error)
+	onResponse func(resp Resp) error
+	onError    func(err error) (Resp, error)
+}
+
+// Call runs a proxy service-layer method through the health check and
+// response finalization hooks. It deliberately does not record
+// milvus_proxy_req_count: the request is counted exactly once at the boundary
+// it entered through -- UnaryRequestStatsInterceptor for gRPC, wrapperPost for
+// REST v2 -- and a second count here would double-report every request. It
+// only owns the latency series, which no boundary covers for these methods.
+func (i *InterceptorImpl[Req, Resp]) Call(ctx context.Context, request Req,
+) (Resp, error) {
+	if err := merr.CheckHealthy(i.proxy.GetStateCode()); err != nil {
+		return i.onError(err)
+	}
+
+	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, fmt.Sprintf("Proxy-%s", i.method))
+	defer sp.End()
+	tr := timerecord.NewTimeRecorder(i.method)
+	nodeID := strconv.FormatInt(paramtable.GetNodeID(), 10)
+	defer func() {
+		metrics.ProxyReqLatency.WithLabelValues(nodeID, i.method).
+			Observe(float64(tr.ElapseSpan().Milliseconds()))
+	}()
+
+	resp, err := i.onCall(ctx, request)
+	if err != nil {
+		return i.onError(err)
+	}
+
+	if i.onResponse != nil && merr.Ok(resp.GetStatus()) {
+		if err := i.onResponse(resp); err != nil {
+			return i.onError(err)
+		}
+	}
+
+	return resp, nil
+}
+
+type CachedProxyServiceProvider struct {
+	*Proxy
+}
+
+func finalizeDescribeCollectionResponse(resp *milvuspb.DescribeCollectionResponse) error {
+	if resp == nil || !merr.Ok(resp.GetStatus()) {
+		return nil
+	}
+	if resp.GetSchema() == nil {
+		return merr.WrapErrServiceInternalMsg("describe collection returned a nil projected schema")
+	}
+	if err := timestamptz.RewriteTimestampTzDefaultValueToString(resp.Schema); err != nil {
+		return merr.WrapErrServiceInternalErr(err, "failed to project TIMESTAMPTZ default value")
+	}
+	resp.Schema.ExternalSpec = externalspec.RedactExternalSpec(resp.Schema.GetExternalSpec())
+	return nil
+}
+
+func (node *CachedProxyServiceProvider) DescribeCollection(ctx context.Context,
+	request *milvuspb.DescribeCollectionRequest,
+) (resp *milvuspb.DescribeCollectionResponse, err error) {
+	log := mlog.With(
+		mlog.String("role", typeutil.ProxyRole),
+		mlog.String("db", request.GetDbName()),
+		mlog.String("collection", request.GetCollectionName()),
+		mlog.FieldCollectionID(request.GetCollectionID()),
+		mlog.Uint64("timestamp", request.GetTimeStamp()),
+	)
+
+	log.Debug(ctx, "DescribeCollection received")
+
+	resp = &milvuspb.DescribeCollectionResponse{
+		Status:         merr.Success(),
+		CollectionName: request.CollectionName,
+		DbName:         request.DbName,
+	}
+
+	// Resolve identifiers on local copies instead of mutating the request: the
+	// access log interceptor and the success metric labels read the request
+	// after the handler returns, and must see what the client actually sent.
+	collectionName := request.CollectionName
+	collectionID := request.CollectionID
+	var c *collectionInfo
+	// Shared metadata lookups use the intra-cluster identity. A caller's stale
+	// outgoing authorization must not make cache misses depend on another user.
+	// Keep the original context for the per-request visibility check below.
+	metadataCtx := describeCollectionMetadataContext(ctx)
+
+	resolvedNameByID := collectionName == "" && collectionID > 0
+	if resolvedNameByID {
+		// Resolve the complete entry by id once. Calling GetCollectionName first
+		// discarded the returned collectionInfo and forced a second describe on a
+		// rolling-upgrade old RootCoord response that omitted DbName (such entries
+		// are deliberately returned uncached because their database is unknown).
+		c, err = node.GetMetaCache().GetCollectionInfo(metadataCtx, request.DbName, "", collectionID)
+		if err != nil {
+			resp.Status = DescribeCollectionErrorStatus(err, request.DbName, collectionName)
+			return resp, nil
+		}
+		collectionName = c.Schema.GetName()
+	}
+
+	// validate collection name, ref describeCollectionTask.PreExecute
+	if err = validateCollectionName(collectionName); err != nil {
+		resp.Status = DescribeCollectionErrorStatus(err, request.DbName, collectionName)
+		return resp, nil
+	}
+
+	// Resolve the id and complete entry from the name only when the caller did
+	// not provide an id. The id-only path already has the complete entry above.
+	if !resolvedNameByID {
+		collectionID, err = node.GetMetaCache().GetCollectionID(metadataCtx, request.DbName, collectionName)
+		if err != nil {
+			resp.Status = DescribeCollectionErrorStatus(err, request.DbName, collectionName)
+			return resp, nil
+		}
+		c, err = node.GetMetaCache().GetCollectionInfo(metadataCtx, request.DbName, collectionName, collectionID)
+		if err != nil {
+			resp.Status = DescribeCollectionErrorStatus(err, request.DbName, collectionName)
+			return resp, nil
+		}
+	}
+
+	if err := node.checkCollectionVisibility(ctx, c); err != nil {
+		return nil, err
+	}
+
+	// The base logger was built from the raw request, whose name is empty for
+	// id-only requests; surface the resolved name so downstream log lines stay
+	// traceable. The request itself is left untouched -- the access log and
+	// metric labels read it as the client sent it.
+	if resolvedNameByID {
+		log = log.With(mlog.String("resolvedCollection", collectionName))
+	}
+
+	if resp.CollectionName == "" {
+		resp.CollectionName = c.Schema.Name
+	}
+
+	resp.Schema, err = ProjectDescribeCollectionSchema(c.Schema.CollectionSchema, true)
+	if err != nil {
+		log.Error(ctx, "failed to project collection schema", mlog.Err(err))
+		return nil, err
+	}
+
+	// prefer the actual database resolved by the coordinator and carried in the
+	// cache, the request db name may be empty/default when querying by collection id
+	if c.DBName != "" {
+		resp.DbName = c.DBName
+	}
+	resp.DbId = c.DBID
+	resp.CollectionID = c.CollID
+	resp.UpdateTimestamp = c.UpdateTimestamp
+	resp.UpdateTimestampStr = strconv.FormatUint(c.UpdateTimestamp, 10)
+	resp.CreatedTimestamp = c.CreatedTimestamp
+	resp.CreatedUtcTimestamp = c.CreatedUtcTimestamp
+	resp.ConsistencyLevel = c.ConsistencyLevel
+	resp.VirtualChannelNames = c.VChannels
+	resp.PhysicalChannelNames = c.PChannels
+	resp.NumPartitions = c.NumPartitions
+	resp.ShardsNum = c.ShardsNum
+	resp.Aliases = c.Aliases
+	resp.Properties = c.Properties
+	log.Debug(ctx, "DescribeCollection done",
+		mlog.FieldCollectionID(resp.GetCollectionID()),
+		mlog.Int("fieldCount", len(resp.GetSchema().GetFields())),
+		mlog.Int("schemaVersion", int(resp.GetSchema().GetVersion())),
+	)
+	return resp, nil
+}
+
+// checkCollectionVisibility keeps authorization out of the shared metadata
+// cache. DescribeCollection is granted to public, but object visibility is a
+// separate decision. Check every response, including hot cache hits and IDs in
+// another database. The experimental local projection falls back to RC when
+// unavailable; RC remains the default until snapshot consistency is complete.
+func (node *CachedProxyServiceProvider) checkCollectionVisibility(ctx context.Context, collection *collectionInfo) error {
+	return node.checkResolvedCollectionVisibility(ctx, collection.DBName, collection.Schema.GetName(), collection.CollID)
+}
+
+func (node *Proxy) checkResolvedCollectionVisibility(ctx context.Context, database, collection string, id int64) error {
+	if !Params.CommonCfg.AuthorizationEnabled.GetAsBool() {
+		return nil
+	}
+	if err := checkDescribeCollectionUser(ctx); err != nil {
+		return err
+	}
+	if database == "" {
+		// Older coordinators may not return the database for an ID-only lookup.
+		// The caller's database is not evidence of the resolved object's owner.
+		return merr.WrapErrServiceUnavailable("collection database is unavailable for visibility check")
+	}
+
+	if known, err := tryLocalCollectionVisibility(ctx, database, collection, id); known {
+		return err
+	}
+
+	// Replace an existing outgoing identity rather than appending to it: the
+	// first authorization value is what RootCoord consumes. Only the incoming
+	// identity already authenticated at the public API may select the user.
+	visible, err := node.mixCoord.DescribeCollection(DescribeCollectionRPCContext(ctx), &milvuspb.DescribeCollectionRequest{
+		Base:           commonpbutil.NewMsgBase(commonpbutil.WithMsgType(commonpb.MsgType_DescribeCollection)),
+		DbName:         database,
+		CollectionName: collection,
+		CollectionID:   id,
+	})
+	if err := merr.CheckRPCCall(visible, err); err != nil {
+		return err
+	}
+	if visible.GetCollectionID() == id {
+		return nil
+	}
+	// A rename or drop/recreate can race the cached lookup. Deny the stale
+	// response without blaming the caller for inconsistent metadata.
+	return merr.WrapErrServiceUnavailable("collection changed during visibility check")
+}
+
+func describeCollectionMetadataContext(ctx context.Context) context.Context {
+	md, _ := metadata.FromOutgoingContext(ctx)
+	md = md.Copy()
+	md.Delete(util.HeaderAuthorize)
+	return metadata.NewOutgoingContext(ctx, md)
+}
+
+func checkDescribeCollectionUser(ctx context.Context) error {
+	if !Params.CommonCfg.AuthorizationEnabled.GetAsBool() {
+		return nil
+	}
+	user, err := GetCurUserFromContext(ctx)
+	if err != nil || user == "" {
+		return merr.WrapErrPrivilegeNotPermitted("describe collection requires an authenticated user")
+	}
+	return nil
+}
+
+type RemoteProxyServiceProvider struct {
+	*Proxy
+}
+
+func (node *RemoteProxyServiceProvider) DescribeCollection(ctx context.Context,
+	request *milvuspb.DescribeCollectionRequest,
+) (*milvuspb.DescribeCollectionResponse, error) {
+	localVisibility := localCollectionVisibilityEnabled()
+	dct := NewDescribeCollectionTask(ctx, node, request)
+	if localVisibility {
+		dct.UseInternalMetadata()
+	}
+
+	log := mlog.With(
+		mlog.String("role", typeutil.ProxyRole),
+		mlog.String("db", request.DbName),
+		mlog.String("collection", request.CollectionName))
+
+	log.Debug(ctx, "DescribeCollection received")
+
+	if err := node.sched.DdQueue.Enqueue(dct); err != nil {
+		log.Warn(ctx, "DescribeCollection failed to enqueue",
+			mlog.Err(err))
+
+		return nil, err
+	}
+
+	log.Debug(ctx, "DescribeCollection enqueued",
+		mlog.Uint64("BeginTS", dct.BeginTs()),
+		mlog.Uint64("EndTS", dct.EndTs()))
+
+	if err := dct.WaitToFinish(); err != nil {
+		log.Warn(ctx, "DescribeCollection failed to WaitToFinish",
+			mlog.Err(err),
+			mlog.Uint64("BeginTS", dct.BeginTs()),
+			mlog.Uint64("EndTS", dct.EndTs()))
+
+		return nil, err
+	}
+
+	log.Debug(ctx, "DescribeCollection done",
+		mlog.Uint64("BeginTS", dct.BeginTs()),
+		mlog.Uint64("EndTS", dct.EndTs()),
+	)
+
+	result := dct.Result()
+	if localVisibility && merr.Ok(result.GetStatus()) {
+		if err := node.checkResolvedCollectionVisibility(ctx, result.GetDbName(), result.GetSchema().GetName(), result.GetCollectionID()); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}

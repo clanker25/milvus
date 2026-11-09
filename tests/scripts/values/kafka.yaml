@@ -1,0 +1,5 @@
+kafka:
+  enabled: false
+  defaultReplicationFactor: 2
+pulsar:
+  enabled: false

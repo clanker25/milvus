@@ -1,0 +1,3478 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package querynodev2
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"math/rand"
+	"path"
+	"sort"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/apache/arrow/go/v17/arrow/ipc"
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/suite"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
+	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
+	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
+	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/streamingnode/client/handler"
+	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/registry"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/materialize"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	streamingstatus "github.com/milvus-io/milvus/internal/util/streamingutil/status"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/util"
+	"github.com/milvus-io/milvus/internal/util/streamrpc"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/segcorepb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/conc"
+	"github.com/milvus-io/milvus/pkg/v3/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/resource"
+	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+type ServiceSuite struct {
+	suite.Suite
+	// Data
+	collectionID   int64
+	collectionName string
+	schema         *schemapb.CollectionSchema
+	partitionIDs   []int64
+	// Test segments
+	validSegmentIDs     []int64
+	flushedSegmentIDs   []int64
+	droppedSegmentIDs   []int64
+	levelZeroSegmentIDs []int64
+	// Test channel
+	vchannel string
+	pchannel string
+	channel  metautil.Channel
+	mapper   metautil.ChannelMapper
+	position *msgpb.MsgPosition
+
+	// Dependency
+	node                *QueryNode
+	etcdClient          *clientv3.Client
+	rootPath            string
+	chunkManagerFactory *storage.ChunkManagerFactory
+
+	// Mock
+	factory *dependency.MockFactory
+}
+
+func (suite *ServiceSuite) SetupSuite() {
+	// collection and segments data
+	// init param
+	paramtable.Init()
+	paramtable.Get().Save(paramtable.Get().CommonCfg.GCEnabled.Key, "false")
+
+	suite.rootPath = suite.T().Name()
+	suite.collectionID = 111
+	suite.collectionName = "test-collection"
+	suite.partitionIDs = []int64{222}
+	suite.validSegmentIDs = []int64{1, 2, 3}
+	suite.flushedSegmentIDs = []int64{5, 6}
+	suite.droppedSegmentIDs = []int64{7, 8, 9}
+	suite.levelZeroSegmentIDs = []int64{4}
+
+	var err error
+	suite.mapper = metautil.NewDynChannelMapper()
+	// channel data
+	suite.vchannel = "by-dev-rootcoord-dml_0_111v0"
+	suite.pchannel = funcutil.ToPhysicalChannel(suite.vchannel)
+	suite.channel, err = metautil.ParseChannel(suite.vchannel, suite.mapper)
+	suite.Require().NoError(err)
+
+	suite.position = &msgpb.MsgPosition{
+		ChannelName: suite.vchannel,
+		MsgID:       []byte{0, 0, 0, 0, 0, 0, 0, 0},
+	}
+}
+
+func (suite *ServiceSuite) SetupTest() {
+	ctx := context.Background()
+	// init mock
+	suite.factory = dependency.NewMockFactory(suite.T())
+	// TODO:: cpp chunk manager not support local chunk manager
+	paramtable.Get().Save(paramtable.Get().LocalStorageCfg.Path.Key, suite.T().TempDir())
+	// suite.chunkManagerFactory = storage.NewChunkManagerFactory("local", storage.RootPath("/tmp/milvus-test"))
+	suite.chunkManagerFactory = storage.NewTestChunkManagerFactory(paramtable.Get(), suite.rootPath)
+	suite.factory.EXPECT().Init(mock.Anything).Return()
+	suite.factory.EXPECT().NewPersistentStorageChunkManager(mock.Anything).Return(suite.chunkManagerFactory.NewPersistentStorageChunkManager(ctx))
+
+	var err error
+	suite.node = NewQueryNode(ctx, suite.factory)
+	// init etcd
+	suite.etcdClient, err = etcd.GetEtcdClient(
+		paramtable.Get().EtcdCfg.UseEmbedEtcd.GetAsBool(),
+		paramtable.Get().EtcdCfg.EtcdUseSSL.GetAsBool(),
+		paramtable.Get().EtcdCfg.Endpoints.GetAsStrings(),
+		paramtable.Get().EtcdCfg.EtcdTLSCert.GetValue(),
+		paramtable.Get().EtcdCfg.EtcdTLSKey.GetValue(),
+		paramtable.Get().EtcdCfg.EtcdTLSCACert.GetValue(),
+		paramtable.Get().EtcdCfg.EtcdTLSMinVersion.GetValue())
+	suite.NoError(err)
+	suite.node.SetEtcdClient(suite.etcdClient)
+	// init node
+	err = suite.node.Init()
+	suite.NoError(err)
+	// start node
+	err = suite.node.Start()
+	suite.NoError(err)
+}
+
+func (suite *ServiceSuite) TearDownTest() {
+	suite.node.UpdateStateCode(commonpb.StateCode_Healthy)
+	ctx := context.Background()
+	// ReleaseSegment, avoid throwing an instance of 'std::system_error' when stop node
+	resp, err := suite.node.ReleaseSegments(ctx, &querypb.ReleaseSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_ReleaseSegments,
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+		SegmentIDs:   suite.validSegmentIDs,
+		NodeID:       suite.node.session.ServerID,
+		Scope:        querypb.DataScope_All,
+		Shard:        suite.vchannel,
+	})
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, resp.ErrorCode)
+	suite.node.chunkManager.RemoveWithPrefix(ctx, paramtable.Get().LocalStorageCfg.Path.GetValue())
+	suite.node.Stop()
+	suite.etcdClient.Close()
+	paramtable.Get().Reset(paramtable.Get().LocalStorageCfg.Path.Key)
+}
+
+func (suite *ServiceSuite) TestGetComponentStatesNormal() {
+	ctx := context.Background()
+	suite.node.session.UpdateRegistered(true)
+	rsp, err := suite.node.GetComponentStates(ctx, nil)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+	suite.Equal(commonpb.StateCode_Healthy, rsp.State.StateCode)
+
+	// after update
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	rsp, err = suite.node.GetComponentStates(ctx, nil)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+	suite.Equal(commonpb.StateCode_Abnormal, rsp.State.StateCode)
+}
+
+func (suite *ServiceSuite) TestGetTimeTiclChannel_Normal() {
+	ctx := context.Background()
+	rsp, err := suite.node.GetTimeTickChannel(ctx, nil)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetStatisChannel_Normal() {
+	ctx := context.Background()
+	rsp, err := suite.node.GetStatisticsChannel(ctx, nil)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetStatistics_Normal() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	suite.syncDistribution(context.TODO())
+
+	req := &querypb.GetStatisticsRequest{
+		Req: &internalpb.GetStatisticsRequest{
+			Base: &commonpb.MsgBase{
+				MsgType:  commonpb.MsgType_WatchDmChannels,
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID: suite.collectionID,
+			PartitionIDs: []int64{},
+		},
+		DmlChannels: []string{suite.vchannel},
+		SegmentIDs:  suite.validSegmentIDs,
+	}
+
+	rsp, err := suite.node.GetStatistics(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetStatistics_Failed() {
+	ctx := context.Background()
+	// prepare
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	req := &querypb.GetStatisticsRequest{
+		Req: &internalpb.GetStatisticsRequest{
+			Base: &commonpb.MsgBase{
+				MsgType:  commonpb.MsgType_WatchDmChannels,
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID: suite.collectionID,
+			PartitionIDs: []int64{},
+		},
+		DmlChannels: []string{suite.vchannel},
+		SegmentIDs:  suite.validSegmentIDs,
+	}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	resp, err := suite.node.GetStatistics(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, resp.Status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestWatchDmChannelsInt64() {
+	ctx := context.Background()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	deltaLogs, err := mock_segcore.SaveDeltaLog(suite.collectionID,
+		suite.partitionIDs[0],
+		suite.flushedSegmentIDs[0],
+		suite.node.chunkManager,
+	)
+	suite.NoError(err)
+
+	req := &querypb.WatchDmChannelsRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_WatchDmChannels,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		NodeID:       suite.node.session.ServerID,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+		Infos: []*datapb.VchannelInfo{
+			{
+				CollectionID:        suite.collectionID,
+				ChannelName:         suite.vchannel,
+				SeekPosition:        suite.position,
+				FlushedSegmentIds:   suite.flushedSegmentIDs,
+				DroppedSegmentIds:   suite.droppedSegmentIDs,
+				LevelZeroSegmentIds: suite.levelZeroSegmentIDs,
+			},
+		},
+		SegmentInfos: map[int64]*datapb.SegmentInfo{
+			suite.levelZeroSegmentIDs[0]: {
+				ID:            suite.levelZeroSegmentIDs[0],
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionIDs[0],
+				InsertChannel: suite.vchannel,
+				Deltalogs:     deltaLogs,
+				Level:         datapb.SegmentLevel_L0,
+			},
+		},
+		Schema: schema,
+		LoadMeta: &querypb.LoadMetaInfo{
+			LoadType:     querypb.LoadType_LoadCollection,
+			CollectionID: suite.collectionID,
+			PartitionIDs: suite.partitionIDs,
+			MetricType:   defaultMetricType,
+		},
+		IndexInfoList: mock_segcore.GenTestIndexInfoList(suite.collectionID, schema),
+	}
+
+	// watchDmChannels
+	status, err := suite.node.WatchDmChannels(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+
+	// watch channel exist
+	status, err = suite.node.WatchDmChannels(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+}
+
+func (suite *ServiceSuite) TestWatchDmChannelsVarchar() {
+	ctx := context.Background()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_VarChar, false)
+
+	req := &querypb.WatchDmChannelsRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_WatchDmChannels,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		NodeID:       suite.node.session.ServerID,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+		Infos: []*datapb.VchannelInfo{
+			{
+				CollectionID:      suite.collectionID,
+				ChannelName:       suite.vchannel,
+				SeekPosition:      suite.position,
+				FlushedSegmentIds: suite.flushedSegmentIDs,
+				DroppedSegmentIds: suite.droppedSegmentIDs,
+			},
+		},
+		Schema: schema,
+		LoadMeta: &querypb.LoadMetaInfo{
+			LoadType:     querypb.LoadType_LoadCollection,
+			CollectionID: suite.collectionID,
+			PartitionIDs: suite.partitionIDs,
+			MetricType:   defaultMetricType,
+		},
+		IndexInfoList: mock_segcore.GenTestIndexInfoList(suite.collectionID, schema),
+	}
+
+	// watchDmChannels
+	status, err := suite.node.WatchDmChannels(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+
+	// watch channel exist
+	status, err = suite.node.WatchDmChannels(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+}
+
+func (suite *ServiceSuite) TestWatchDmChannels_BadIndexMeta() {
+	ctx := context.Background()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	deltaLogs, err := mock_segcore.SaveDeltaLog(suite.collectionID,
+		suite.partitionIDs[0],
+		suite.flushedSegmentIDs[0],
+		suite.node.chunkManager,
+	)
+	suite.NoError(err)
+
+	req := &querypb.WatchDmChannelsRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_WatchDmChannels,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		NodeID:       suite.node.session.ServerID,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+		Infos: []*datapb.VchannelInfo{
+			{
+				CollectionID:        suite.collectionID,
+				ChannelName:         suite.vchannel,
+				SeekPosition:        suite.position,
+				FlushedSegmentIds:   suite.flushedSegmentIDs,
+				DroppedSegmentIds:   suite.droppedSegmentIDs,
+				LevelZeroSegmentIds: suite.levelZeroSegmentIDs,
+			},
+		},
+		SegmentInfos: map[int64]*datapb.SegmentInfo{
+			suite.levelZeroSegmentIDs[0]: {
+				ID:            suite.levelZeroSegmentIDs[0],
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionIDs[0],
+				InsertChannel: suite.vchannel,
+				Deltalogs:     deltaLogs,
+				Level:         datapb.SegmentLevel_L0,
+			},
+		},
+		Schema: schema,
+		LoadMeta: &querypb.LoadMetaInfo{
+			LoadType:     querypb.LoadType_LoadCollection,
+			CollectionID: suite.collectionID,
+			PartitionIDs: suite.partitionIDs,
+			MetricType:   defaultMetricType,
+		},
+		IndexInfoList: []*indexpb.IndexInfo{{
+			IndexName: "bad_index",
+			FieldID:   100,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: "dup_key", Value: "val"},
+				{Key: "dup_key", Value: "val"},
+			},
+		}},
+	}
+
+	// watchDmChannels
+	status, err := suite.node.WatchDmChannels(ctx, req)
+	suite.Error(merr.CheckRPCCall(status, err))
+}
+
+func (suite *ServiceSuite) TestWatchDmChannels_Failed() {
+	ctx := context.Background()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+
+	indexInfos := mock_segcore.GenTestIndexInfoList(suite.collectionID, schema)
+
+	infos := suite.genSegmentLoadInfos(schema, indexInfos)
+	segmentInfos := lo.SliceToMap(infos, func(info *querypb.SegmentLoadInfo) (int64, *datapb.SegmentInfo) {
+		return info.SegmentID, &datapb.SegmentInfo{
+			ID:            info.SegmentID,
+			CollectionID:  info.CollectionID,
+			PartitionID:   info.PartitionID,
+			InsertChannel: info.InsertChannel,
+			Binlogs:       info.BinlogPaths,
+			Statslogs:     info.Statslogs,
+			Deltalogs:     info.Deltalogs,
+			Level:         info.Level,
+		}
+	})
+
+	req := &querypb.WatchDmChannelsRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_WatchDmChannels,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		NodeID:       suite.node.session.ServerID,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+		Infos: []*datapb.VchannelInfo{
+			{
+				CollectionID:      suite.collectionID,
+				ChannelName:       suite.vchannel,
+				SeekPosition:      suite.position,
+				FlushedSegmentIds: suite.flushedSegmentIDs,
+				DroppedSegmentIds: suite.droppedSegmentIDs,
+			},
+		},
+		Schema: schema,
+		LoadMeta: &querypb.LoadMetaInfo{
+			MetricType: defaultMetricType,
+		},
+		SegmentInfos:  segmentInfos,
+		IndexInfoList: indexInfos,
+	}
+
+	// test channel is unsubscribing
+	suite.node.unsubscribingChannels.Insert(suite.vchannel)
+	status, err := suite.node.WatchDmChannels(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(status), merr.ErrChannelReduplicate)
+	suite.node.unsubscribingChannels.Remove(suite.vchannel)
+
+	// load growing failed
+	badSegmentReq := typeutil.Clone(req)
+	for _, info := range badSegmentReq.SegmentInfos {
+		for _, fbl := range info.Binlogs {
+			for _, binlog := range fbl.Binlogs {
+				binlog.LogPath += "bad_suffix"
+			}
+		}
+	}
+	for _, channel := range badSegmentReq.Infos {
+		channel.UnflushedSegmentIds = lo.Keys(badSegmentReq.SegmentInfos)
+	}
+	status, err = suite.node.WatchDmChannels(ctx, badSegmentReq)
+	err = merr.CheckRPCCall(status, err)
+	suite.Error(err)
+
+	// empty index
+	req.IndexInfoList = nil
+	status, err = suite.node.WatchDmChannels(ctx, req)
+	err = merr.CheckRPCCall(status, err)
+	suite.ErrorIs(err, merr.ErrIndexNotFound)
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err = suite.node.WatchDmChannels(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+}
+
+// TestWatchDmChannels_CanceledContextRollsBack covers the commit-point check
+// added at services.go: WatchDmChannels checks ctx.Err() once, right before
+// pipeline.Start()/delegator.Start(), so a caller whose context is canceled
+// (e.g. the coordinator's task deadline expired while this call was in
+// flight) doesn't leave the node subscribed to a channel the coordinator has
+// already given up on. This asserts the rollback actually happens: the
+// delegator this call registers is not left behind on failure.
+func (suite *ServiceSuite) TestWatchDmChannels_CanceledContextRollsBack() {
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	indexInfos := mock_segcore.GenTestIndexInfoList(suite.collectionID, schema)
+	infos := suite.genSegmentLoadInfos(schema, indexInfos)
+	segmentInfos := lo.SliceToMap(infos, func(info *querypb.SegmentLoadInfo) (int64, *datapb.SegmentInfo) {
+		return info.SegmentID, &datapb.SegmentInfo{
+			ID:            info.SegmentID,
+			CollectionID:  info.CollectionID,
+			PartitionID:   info.PartitionID,
+			InsertChannel: info.InsertChannel,
+			Binlogs:       info.BinlogPaths,
+			Statslogs:     info.Statslogs,
+			Deltalogs:     info.Deltalogs,
+			Level:         info.Level,
+		}
+	})
+
+	req := &querypb.WatchDmChannelsRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_WatchDmChannels,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		NodeID:       suite.node.session.ServerID,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+		Infos: []*datapb.VchannelInfo{
+			{
+				CollectionID:      suite.collectionID,
+				ChannelName:       suite.vchannel,
+				SeekPosition:      suite.position,
+				FlushedSegmentIds: suite.flushedSegmentIDs,
+				DroppedSegmentIds: suite.droppedSegmentIDs,
+			},
+		},
+		Schema: schema,
+		LoadMeta: &querypb.LoadMetaInfo{
+			MetricType: defaultMetricType,
+		},
+		SegmentInfos:  segmentInfos,
+		IndexInfoList: indexInfos,
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	status, err := suite.node.WatchDmChannels(canceledCtx, req)
+	suite.NoError(err, "the RPC itself should return a Status, not a transport error")
+	suite.NotEqual(commonpb.ErrorCode_Success, status.GetErrorCode(),
+		"watch must not succeed once its context is already canceled")
+
+	_, ok := suite.node.delegators.Get(suite.vchannel)
+	suite.False(ok, "a canceled watch must not leave its delegator registered")
+}
+
+func (suite *ServiceSuite) TestUnsubDmChannels_Normal() {
+	ctx := context.Background()
+
+	// prepate
+	suite.TestWatchDmChannelsInt64()
+
+	// data
+	req := &querypb.UnsubDmChannelRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_UnsubDmChannel,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		NodeID:       suite.node.session.ServerID,
+		CollectionID: suite.collectionID,
+		ChannelName:  suite.vchannel,
+	}
+
+	status, err := suite.node.UnsubDmChannel(ctx, req)
+	suite.NoError(merr.CheckRPCCall(status, err))
+}
+
+func (suite *ServiceSuite) TestUnsubDmChannels_Failed() {
+	ctx := context.Background()
+	// prepate
+	suite.TestWatchDmChannelsInt64()
+
+	// data
+	req := &querypb.UnsubDmChannelRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_UnsubDmChannel,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		NodeID:       suite.node.session.ServerID,
+		CollectionID: suite.collectionID,
+		ChannelName:  suite.vchannel,
+	}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err := suite.node.UnsubDmChannel(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+}
+
+func TestIsReleaseManualFlushPrepareUnavailable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "service unavailable",
+			err:  merr.WrapErrServiceUnavailable("streaming WAL is not initialized"),
+			want: true,
+		},
+		{
+			name: "channel not available",
+			err:  merr.WrapErrChannelNotAvailable("vchannel", "no local growing-source release handoff provider"),
+			want: true,
+		},
+		{
+			name: "handler client closed",
+			err:  handler.ErrClientClosed,
+			want: true,
+		},
+		{
+			name: "read only local wal",
+			err:  handler.ErrReadOnlyWAL,
+			want: true,
+		},
+		{
+			name: "no streaming node deployed",
+			err:  registry.ErrNoStreamingNodeDeployed,
+			want: true,
+		},
+		{
+			name: "no release manual flush preparer",
+			err:  registry.ErrNoReleaseManualFlushPreparer,
+			want: true,
+		},
+		{
+			name: "streaming on shutdown",
+			err:  streamingstatus.NewOnShutdownError("wal is on shutdown"),
+			want: true,
+		},
+		{
+			name: "local wal channel not exist",
+			err:  streamingstatus.NewChannelNotExist("pchannel"),
+			want: true,
+		},
+		{
+			name: "local wal channel term unmatched",
+			err:  streamingstatus.NewUnmatchedChannelTerm("pchannel", 1, 2),
+			want: true,
+		},
+		{
+			name: "generic prepare failure",
+			err:  errors.New("prepare failed"),
+			want: false,
+		},
+		{
+			name: "streaming inner failure",
+			err:  streamingstatus.NewInner("prepare failed"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isReleaseManualFlushPrepareUnavailable(tt.err))
+		})
+	}
+}
+
+func (suite *ServiceSuite) genSegmentLoadInfos(schema *schemapb.CollectionSchema,
+	indexInfos []*indexpb.IndexInfo,
+) []*querypb.SegmentLoadInfo {
+	ctx := context.Background()
+
+	segNum := len(suite.validSegmentIDs)
+	partNum := len(suite.partitionIDs)
+	infos := make([]*querypb.SegmentLoadInfo, 0)
+	for i := 0; i < segNum; i++ {
+		binlogs, statslogs, err := mock_segcore.SaveBinLog(ctx,
+			suite.collectionID,
+			suite.partitionIDs[i%partNum],
+			suite.validSegmentIDs[i],
+			1000,
+			schema,
+			suite.node.chunkManager,
+		)
+		suite.Require().NoError(err)
+
+		vectorFieldSchemas := typeutil.GetVectorFieldSchemas(schema)
+		indexes := make([]*querypb.FieldIndexInfo, 0)
+		for offset, field := range vectorFieldSchemas {
+			indexInfo := lo.FindOrElse(indexInfos, nil, func(info *indexpb.IndexInfo) bool { return info.FieldID == field.GetFieldID() })
+			if indexInfo != nil {
+				index, err := mock_segcore.GenAndSaveIndexV2(
+					suite.collectionID,
+					suite.partitionIDs[i%partNum],
+					suite.validSegmentIDs[i],
+					int64(offset),
+					field,
+					indexInfo,
+					suite.node.chunkManager,
+					1000,
+				)
+				suite.Require().NoError(err)
+				index.NumRows = 1000
+				indexes = append(indexes, index)
+			}
+		}
+
+		info := &querypb.SegmentLoadInfo{
+			SegmentID:     suite.validSegmentIDs[i],
+			PartitionID:   suite.partitionIDs[i%partNum],
+			CollectionID:  suite.collectionID,
+			InsertChannel: suite.vchannel,
+			NumOfRows:     1000,
+			BinlogPaths:   binlogs,
+			Statslogs:     statslogs,
+			IndexInfos:    indexes,
+			StartPosition: &msgpb.MsgPosition{Timestamp: 20000},
+			DeltaPosition: &msgpb.MsgPosition{Timestamp: 20000},
+		}
+		infos = append(infos, info)
+	}
+	return infos
+}
+
+func (suite *ServiceSuite) TestLoadSegments_Int64() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	indexInfos := mock_segcore.GenTestIndexInfoList(suite.collectionID, schema)
+	infos := suite.genSegmentLoadInfos(schema, indexInfos)
+	for _, info := range infos {
+		req := &querypb.LoadSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID:   suite.collectionID,
+			DstNodeID:      suite.node.session.ServerID,
+			Infos:          []*querypb.SegmentLoadInfo{info},
+			Schema:         schema,
+			DeltaPositions: []*msgpb.MsgPosition{{Timestamp: 20000}},
+			NeedTransfer:   true,
+			IndexInfoList:  indexInfos,
+		}
+
+		// LoadSegment
+		status, err := suite.node.LoadSegments(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+	}
+}
+
+func (suite *ServiceSuite) TestLoadSegments_VarChar() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsVarchar()
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_VarChar, false)
+	loadMeta := &querypb.LoadMetaInfo{
+		LoadType:     querypb.LoadType_LoadCollection,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+	}
+	suite.node.manager.Collection = segments.NewCollectionManager()
+	suite.node.manager.Collection.PutOrRef(suite.collectionID, schema, nil, loadMeta)
+
+	infos := suite.genSegmentLoadInfos(schema, nil)
+	for _, info := range infos {
+		req := &querypb.LoadSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID:   suite.collectionID,
+			DstNodeID:      suite.node.session.ServerID,
+			Infos:          []*querypb.SegmentLoadInfo{info},
+			Schema:         schema,
+			DeltaPositions: []*msgpb.MsgPosition{{Timestamp: 20000}},
+			NeedTransfer:   true,
+			LoadMeta:       loadMeta,
+			IndexInfoList:  []*indexpb.IndexInfo{{}},
+		}
+
+		// LoadSegment
+		status, err := suite.node.LoadSegments(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+	}
+}
+
+func (suite *ServiceSuite) TestLoadSegments_BadIndexMeta() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsVarchar()
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_VarChar, false)
+	loadMeta := &querypb.LoadMetaInfo{
+		LoadType:     querypb.LoadType_LoadCollection,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+	}
+	suite.node.manager.Collection = segments.NewCollectionManager()
+	// suite.node.manager.Collection.PutOrRef(suite.collectionID, schema, nil, loadMeta)
+
+	infos := suite.genSegmentLoadInfos(schema, nil)
+	for _, info := range infos {
+		req := &querypb.LoadSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID:   suite.collectionID,
+			DstNodeID:      suite.node.session.ServerID,
+			Infos:          []*querypb.SegmentLoadInfo{info},
+			Schema:         schema,
+			DeltaPositions: []*msgpb.MsgPosition{{Timestamp: 20000}},
+			NeedTransfer:   true,
+			LoadMeta:       loadMeta,
+			IndexInfoList: []*indexpb.IndexInfo{{
+				IndexName: "bad_index",
+				FieldID:   100,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: "dup_key", Value: "val"},
+					{Key: "dup_key", Value: "val"},
+				},
+			}},
+		}
+
+		// LoadSegment
+		status, err := suite.node.LoadSegments(ctx, req)
+		suite.Error(merr.CheckRPCCall(status, err))
+	}
+}
+
+func (suite *ServiceSuite) TestLoadDeltaInt64() {
+	ctx := context.Background()
+	suite.TestLoadSegments_Int64()
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	req := &querypb.LoadSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID:  suite.collectionID,
+		DstNodeID:     suite.node.session.ServerID,
+		Infos:         suite.genSegmentLoadInfos(schema, nil),
+		Schema:        schema,
+		NeedTransfer:  true,
+		LoadScope:     querypb.LoadScope_Delta,
+		IndexInfoList: []*indexpb.IndexInfo{{}},
+	}
+
+	// LoadSegment
+	status, err := suite.node.LoadSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestLoadDeltaVarchar() {
+	ctx := context.Background()
+	suite.TestLoadSegments_VarChar()
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	req := &querypb.LoadSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID:  suite.collectionID,
+		DstNodeID:     suite.node.session.ServerID,
+		Infos:         suite.genSegmentLoadInfos(schema, nil),
+		Schema:        schema,
+		NeedTransfer:  true,
+		LoadScope:     querypb.LoadScope_Delta,
+		IndexInfoList: []*indexpb.IndexInfo{{}},
+	}
+
+	// LoadSegment
+	status, err := suite.node.LoadSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestLoadSegmentsRejectsUnknownScope() {
+	ctx := context.Background()
+	suite.node.updateDistributionModifyTS()
+	fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotZero(fullResp.GetLastModifyTs())
+
+	schema := mock_segcore.GenTestCollectionSchema(
+		suite.collectionName, schemapb.DataType_Int64, false)
+	req := &querypb.LoadSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID:  suite.collectionID,
+		DstNodeID:     suite.node.session.ServerID,
+		Infos:         suite.genSegmentLoadInfos(schema, nil),
+		Schema:        schema,
+		NeedTransfer:  false,
+		LoadScope:     querypb.LoadScope(99),
+		IndexInfoList: []*indexpb.IndexInfo{{}},
+	}
+
+	time.Sleep(time.Nanosecond)
+	status, err := suite.node.LoadSegments(ctx, req)
+	suite.NoError(err)
+	suite.NotEqual(commonpb.ErrorCode_Success, status.GetErrorCode())
+	suite.Contains(status.GetReason(), "unsupported segment load scope")
+
+	deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Empty(deltaResp.GetSegments())
+	suite.Empty(deltaResp.GetRemovedSegmentIds())
+}
+
+func (suite *ServiceSuite) TestLoadSegmentsRejectsLegacyIndexScope() {
+	ctx := context.Background()
+	suite.node.updateDistributionModifyTS()
+	fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotZero(fullResp.GetLastModifyTs())
+
+	schema := mock_segcore.GenTestCollectionSchema(
+		suite.collectionName, schemapb.DataType_Int64, false)
+	req := &querypb.LoadSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID:  suite.collectionID,
+		DstNodeID:     suite.node.session.ServerID,
+		Infos:         suite.genSegmentLoadInfos(schema, nil),
+		Schema:        schema,
+		NeedTransfer:  false,
+		LoadScope:     legacyLoadScopeIndex,
+		IndexInfoList: []*indexpb.IndexInfo{{}},
+	}
+
+	loader := suite.node.loader
+	suite.node.loader = segments.NewMockLoader(suite.T())
+	defer func() { suite.node.loader = loader }()
+
+	time.Sleep(time.Nanosecond)
+	status, err := suite.node.LoadSegments(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(status), merr.ErrServiceInternal)
+	suite.Contains(status.GetReason(), "legacy segment index load scope 2")
+	suite.Contains(status.GetReason(), "use LoadScope_Reopen")
+
+	deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Empty(deltaResp.GetSegments())
+	suite.Empty(deltaResp.GetRemovedSegmentIds())
+}
+
+func (suite *ServiceSuite) TestLoadSegmentsReopenReportsDelta() {
+	ctx := context.Background()
+	suite.TestLoadSegments_Int64()
+
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	indexInfos := mock_segcore.GenTestIndexInfoList(suite.collectionID, schema)
+	infos := suite.genSegmentLoadInfos(schema, indexInfos)[:1]
+	targetSegmentID := infos[0].GetSegmentID()
+	suite.Require().NotNil(suite.node.manager.Segment.GetSealed(targetSegmentID))
+
+	tests := []struct {
+		name      string
+		reopenErr error
+	}{
+		{name: "success"},
+		{name: "error", reopenErr: errors.New("mocked reopen error")},
+	}
+
+	for _, test := range tests {
+		suite.Run(test.name, func() {
+			fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+			suite.Require().False(fullResp.GetIsDelta())
+			suite.Require().NotZero(fullResp.GetLastModifyTs())
+
+			loader := suite.node.loader
+			mockLoader := segments.NewMockLoader(suite.T())
+			suite.node.loader = mockLoader
+			defer func() { suite.node.loader = loader }()
+
+			req := &querypb.LoadSegmentsRequest{
+				Base: &commonpb.MsgBase{
+					MsgID:    rand.Int63(),
+					TargetID: suite.node.session.ServerID,
+				},
+				CollectionID:  suite.collectionID,
+				DstNodeID:     suite.node.session.ServerID,
+				Infos:         infos,
+				Schema:        schema,
+				NeedTransfer:  false,
+				LoadScope:     querypb.LoadScope_Reopen,
+				IndexInfoList: indexInfos,
+			}
+			mockLoader.EXPECT().ReopenSegments(mock.Anything, req.GetInfos()).Return(test.reopenErr).Once()
+
+			time.Sleep(time.Nanosecond)
+			status, err := suite.node.LoadSegments(ctx, req)
+			suite.Require().NoError(err)
+			if test.reopenErr == nil {
+				suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+			} else {
+				suite.NotEqual(commonpb.ErrorCode_Success, status.GetErrorCode())
+				suite.Contains(status.GetReason(), test.reopenErr.Error())
+			}
+
+			deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+			suite.Require().True(deltaResp.GetIsDelta())
+			suite.Require().Len(deltaResp.GetSegments(), 1)
+			suite.Equal(targetSegmentID, deltaResp.GetSegments()[0].GetID())
+			suite.Empty(deltaResp.GetRemovedSegmentIds())
+		})
+	}
+}
+
+func (suite *ServiceSuite) TestLoadSegments_Failed() {
+	ctx := context.Background()
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	req := &querypb.LoadSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		DstNodeID:    suite.node.session.ServerID,
+		Infos:        suite.genSegmentLoadInfos(schema, nil),
+		Schema:       schema,
+		NeedTransfer: true,
+		IndexInfoList: []*indexpb.IndexInfo{
+			{},
+		},
+	}
+
+	// Delegator not found
+	status, err := suite.node.LoadSegments(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(status), merr.ErrChannelNotFound)
+
+	// IndexIndex not found
+	nonIndexReq := typeutil.Clone(req)
+	nonIndexReq.IndexInfoList = nil
+	status, err = suite.node.LoadSegments(ctx, nonIndexReq)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(status), merr.ErrIndexNotFound)
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err = suite.node.LoadSegments(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(status), merr.ErrServiceNotReady)
+}
+
+func (suite *ServiceSuite) TestLoadSegments_Transfer() {
+	ctx := context.Background()
+	suite.Run("normal_run", func() {
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+
+		delegator.EXPECT().AddExcludedSegments(mock.Anything).Maybe()
+		delegator.EXPECT().VerifyExcludedSegments(mock.Anything, mock.Anything).Return(true).Maybe()
+		delegator.EXPECT().TryCleanExcludedSegments(mock.Anything).Maybe()
+		delegator.EXPECT().LoadSegments(mock.Anything, mock.AnythingOfType("*querypb.LoadSegmentsRequest")).Return(nil)
+		// data
+		schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+		req := &querypb.LoadSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID:  suite.collectionID,
+			DstNodeID:     suite.node.session.ServerID,
+			Infos:         suite.genSegmentLoadInfos(schema, nil),
+			Schema:        schema,
+			NeedTransfer:  true,
+			IndexInfoList: []*indexpb.IndexInfo{{}},
+		}
+
+		// LoadSegment
+		status, err := suite.node.LoadSegments(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+	})
+
+	suite.Run("delegator_not_found", func() {
+		// data
+		schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+		req := &querypb.LoadSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID:  suite.collectionID,
+			DstNodeID:     suite.node.session.ServerID,
+			Infos:         suite.genSegmentLoadInfos(schema, nil),
+			Schema:        schema,
+			NeedTransfer:  true,
+			IndexInfoList: []*indexpb.IndexInfo{{}},
+		}
+
+		// LoadSegment
+		status, err := suite.node.LoadSegments(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_UnexpectedError, status.GetErrorCode())
+	})
+
+	suite.Run("delegator_return_error", func() {
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+		delegator.EXPECT().AddExcludedSegments(mock.Anything).Maybe()
+		delegator.EXPECT().VerifyExcludedSegments(mock.Anything, mock.Anything).Return(true).Maybe()
+		delegator.EXPECT().TryCleanExcludedSegments(mock.Anything).Maybe()
+		delegator.EXPECT().LoadSegments(mock.Anything, mock.AnythingOfType("*querypb.LoadSegmentsRequest")).
+			Return(errors.New("mocked error"))
+		// data
+		schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+		req := &querypb.LoadSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID:  suite.collectionID,
+			DstNodeID:     suite.node.session.ServerID,
+			Infos:         suite.genSegmentLoadInfos(schema, nil),
+			Schema:        schema,
+			NeedTransfer:  true,
+			IndexInfoList: []*indexpb.IndexInfo{{}},
+		}
+
+		// LoadSegment
+		status, err := suite.node.LoadSegments(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_UnexpectedError, status.GetErrorCode())
+	})
+}
+
+func (suite *ServiceSuite) TestReleaseCollection_Normal() {
+	ctx := context.Background()
+	req := &querypb.ReleaseCollectionRequest{}
+	status, err := suite.node.ReleaseCollection(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestReleaseCollection_Failed() {
+	ctx := context.Background()
+	req := &querypb.ReleaseCollectionRequest{}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err := suite.node.ReleaseCollection(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestReleasePartitions_Normal() {
+	ctx := context.Background()
+
+	suite.TestWatchDmChannelsInt64()
+	req := &querypb.ReleasePartitionsRequest{
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+	}
+	status, err := suite.node.ReleasePartitions(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+	collection := suite.node.manager.Collection.Get(suite.collectionID)
+	for _, partition := range suite.partitionIDs {
+		suite.False(collection.ExistPartition(partition))
+	}
+}
+
+func (suite *ServiceSuite) TestReleasePartitions_Failed() {
+	ctx := context.Background()
+	req := &querypb.ReleasePartitionsRequest{}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err := suite.node.ReleasePartitions(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestReleaseSegments_Normal() {
+	ctx := context.Background()
+	suite.TestLoadSegments_Int64()
+
+	req := &querypb.ReleaseSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		SegmentIDs:   suite.validSegmentIDs,
+	}
+
+	status, err := suite.node.ReleaseSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestReleaseSegments_Failed() {
+	ctx := context.Background()
+	suite.TestLoadSegments_Int64()
+
+	req := &querypb.ReleaseSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		SegmentIDs:   suite.validSegmentIDs,
+	}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err := suite.node.ReleaseSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestReleaseSegments_Transfer() {
+	suite.Run("delegator_not_found", func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req := &querypb.ReleaseSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			Shard:        suite.vchannel,
+			CollectionID: suite.collectionID,
+			SegmentIDs:   suite.validSegmentIDs,
+			NeedTransfer: true,
+			NodeID:       paramtable.GetNodeID(),
+		}
+
+		status, err := suite.node.ReleaseSegments(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_UnexpectedError, status.GetErrorCode())
+	})
+
+	suite.Run("normal_run", func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		suite.TestLoadSegments_Int64()
+		req := &querypb.ReleaseSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			Shard:        suite.vchannel,
+			CollectionID: suite.collectionID,
+			SegmentIDs:   suite.validSegmentIDs,
+			NeedTransfer: true,
+			NodeID:       paramtable.GetNodeID(),
+		}
+
+		status, err := suite.node.ReleaseSegments(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+	})
+
+	suite.Run("delegator_return_error", func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+
+		delegator.EXPECT().AddExcludedSegments(mock.Anything).Maybe()
+		delegator.EXPECT().VerifyExcludedSegments(mock.Anything, mock.Anything).Return(true).Maybe()
+		delegator.EXPECT().TryCleanExcludedSegments(mock.Anything).Maybe()
+		delegator.EXPECT().ReleaseSegments(mock.Anything, mock.AnythingOfType("*querypb.ReleaseSegmentsRequest"), false).
+			Return(errors.New("mocked error"))
+
+		req := &querypb.ReleaseSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			Shard:        suite.vchannel,
+			CollectionID: suite.collectionID,
+			SegmentIDs:   suite.validSegmentIDs,
+			NeedTransfer: true,
+			NodeID:       paramtable.GetNodeID(),
+		}
+
+		status, err := suite.node.ReleaseSegments(ctx, req)
+		suite.NoError(err)
+		suite.Equal(commonpb.ErrorCode_UnexpectedError, status.GetErrorCode())
+	})
+}
+
+func (suite *ServiceSuite) TestGetSegmentInfo_Normal() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	req := &querypb.GetSegmentInfoRequest{
+		SegmentIDs: suite.validSegmentIDs,
+	}
+
+	rsp, err := suite.node.GetSegmentInfo(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetSegmentInfo_Failed() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	req := &querypb.GetSegmentInfoRequest{
+		SegmentIDs: suite.validSegmentIDs,
+	}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	rsp, err := suite.node.GetSegmentInfo(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) syncDistribution(ctx context.Context) {
+	suite.node.SyncDistribution(ctx, &querypb.SyncDistributionRequest{
+		Channel:      suite.vchannel,
+		CollectionID: suite.collectionID,
+		LoadMeta: &querypb.LoadMetaInfo{
+			CollectionID: suite.collectionID,
+			PartitionIDs: suite.partitionIDs,
+		},
+		Actions: []*querypb.SyncAction{
+			{
+				Type:                  querypb.SyncType_UpdateVersion,
+				SealedInTarget:        suite.validSegmentIDs,
+				SealedSegmentRowCount: map[int64]int64{1: 100, 2: 100, 3: 100},
+				TargetVersion:         time.Now().UnixNano(),
+			},
+		},
+	})
+}
+
+// Test Search
+func (suite *ServiceSuite) genCSearchRequest(nq int64, dataType schemapb.DataType, fieldID int64, metricType string, isTopkReduce bool, isRecallEvaluation bool) (*internalpb.SearchRequest, error) {
+	placeHolder, err := genPlaceHolderGroup(nq)
+	if err != nil {
+		return nil, err
+	}
+
+	plan := genSearchPlan(dataType, fieldID, metricType)
+	serializedPlan, err2 := proto.Marshal(plan)
+	if err2 != nil {
+		return nil, err2
+	}
+	return &internalpb.SearchRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_Search,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID:       suite.collectionID,
+		PartitionIDs:       suite.partitionIDs,
+		SerializedExprPlan: serializedPlan,
+		PlaceholderGroup:   placeHolder,
+		DslType:            commonpb.DslType_BoolExprV1,
+		Nq:                 nq,
+		MvccTimestamp:      typeutil.MaxTimestamp,
+		IsTopkReduce:       isTopkReduce,
+		IsRecallEvaluation: isRecallEvaluation,
+	}, nil
+}
+
+func (suite *ServiceSuite) TestSearch_Normal() {
+	ctx := context.Background()
+	// pre
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	suite.syncDistribution(ctx)
+
+	creq, err := suite.genCSearchRequest(10, schemapb.DataType_FloatVector, 107, defaultMetricType, false, false)
+	req := &querypb.SearchRequest{
+		Req: creq,
+
+		DmlChannels:     []string{suite.vchannel},
+		TotalChannelNum: 2,
+	}
+	suite.NoError(err)
+
+	rsp, err := suite.node.Search(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestSearch_Concurrent() {
+	ctx := context.Background()
+	// pre
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	suite.syncDistribution(ctx)
+
+	concurrency := 16
+	futures := make([]*conc.Future[*internalpb.SearchResults], 0, concurrency)
+	for i := 0; i < concurrency; i++ {
+		future := conc.Go(func() (*internalpb.SearchResults, error) {
+			creq, err := suite.genCSearchRequest(30, schemapb.DataType_FloatVector, 107, defaultMetricType, false, false)
+			req := &querypb.SearchRequest{
+				Req: creq,
+
+				DmlChannels:     []string{suite.vchannel},
+				TotalChannelNum: 2,
+			}
+			suite.NoError(err)
+			return suite.node.Search(ctx, req)
+		})
+		futures = append(futures, future)
+	}
+
+	err := conc.AwaitAll(futures...)
+	suite.NoError(err)
+
+	for i := range futures {
+		suite.True(merr.Ok(futures[i].Value().GetStatus()))
+	}
+}
+
+func (suite *ServiceSuite) TestSearch_Failed() {
+	ctx := context.Background()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCSearchRequest(10, schemapb.DataType_FloatVector, 107, "invalidMetricType", false, false)
+	req := &querypb.SearchRequest{
+		Req: creq,
+
+		DmlChannels:     []string{suite.vchannel},
+		TotalChannelNum: 2,
+	}
+	suite.NoError(err)
+
+	// collection not exist
+	resp, err := suite.node.Search(ctx, req)
+	suite.NoError(err)
+	suite.Equal(merr.Code(merr.ErrCollectionNotLoaded), resp.GetStatus().GetCode())
+	suite.Contains(resp.GetStatus().GetReason(), merr.ErrCollectionNotLoaded.Error())
+
+	// metric type mismatch
+	LoadMeta := &querypb.LoadMetaInfo{
+		LoadType:     querypb.LoadType_LoadCollection,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+	}
+	indexMeta := segments.ComposeIndexMeta(ctx, mock_segcore.GenTestIndexInfoList(suite.collectionID, schema), schema)
+	suite.node.manager.Collection.PutOrRef(suite.collectionID, schema, indexMeta, LoadMeta)
+
+	// Delegator not found
+	resp, err = suite.node.Search(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(resp.GetStatus()), merr.ErrChannelNotFound)
+
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	// suite.syncDistribution(ctx)
+
+	// sync segment data
+	syncReq := &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      suite.vchannel,
+		LoadMeta: &querypb.LoadMetaInfo{
+			CollectionID: suite.collectionID,
+			PartitionIDs: suite.partitionIDs,
+		},
+	}
+
+	syncVersionAction := &querypb.SyncAction{
+		Type:           querypb.SyncType_UpdateVersion,
+		SealedInTarget: suite.validSegmentIDs,
+		SealedSegmentRowCount: map[int64]int64{
+			1: 100,
+			2: 200,
+			3: 300,
+		},
+		TargetVersion: time.Now().UnixMilli(),
+	}
+
+	syncReq.Actions = []*querypb.SyncAction{syncVersionAction}
+	status, err := suite.node.SyncDistribution(ctx, syncReq)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+
+	// metric type not match
+	req.GetReq().MetricType = "IP"
+	resp, err = suite.node.Search(ctx, req)
+	suite.NoError(err)
+	suite.Contains(resp.GetStatus().GetReason(), "metric type not match")
+	req.GetReq().MetricType = "L2"
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	resp, err = suite.node.Search(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, resp.Status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestSearchSegments_Unhealthy() {
+	ctx := context.Background()
+
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+
+	req := &querypb.SearchRequest{
+		DmlChannels:     []string{suite.vchannel},
+		TotalChannelNum: 2,
+	}
+
+	rsp, err := suite.node.SearchSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(false, rsp.GetIsTopkReduce())
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, rsp.GetStatus().GetErrorCode())
+	suite.Equal(merr.Code(merr.ErrServiceNotReady), rsp.GetStatus().GetCode())
+}
+
+func (suite *ServiceSuite) TestSearchSegments_Failed() {
+	ctx := context.Background()
+
+	// collection found
+	req := &querypb.SearchRequest{
+		Req: &internalpb.SearchRequest{
+			CollectionID: -1, // not exist collection id
+		},
+
+		DmlChannels:     []string{suite.vchannel},
+		TotalChannelNum: 2,
+	}
+
+	rsp, err := suite.node.SearchSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(false, rsp.GetIsTopkReduce())
+	suite.Equal(commonpb.ErrorCode_UnexpectedError, rsp.GetStatus().GetErrorCode())
+	suite.Equal(merr.Code(merr.ErrCollectionNotLoaded), rsp.GetStatus().GetCode())
+
+	suite.TestWatchDmChannelsInt64()
+
+	req.Req.CollectionID = suite.collectionID
+
+	ctx, cancel := context.WithCancel(ctx)
+	cancel()
+	rsp, err = suite.node.SearchSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_UnexpectedError, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestSearchSegments_Normal() {
+	ctx := context.Background()
+	// pre
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	creq, err := suite.genCSearchRequest(10, schemapb.DataType_FloatVector, 107, defaultMetricType, false, false)
+	req := &querypb.SearchRequest{
+		Req: creq,
+
+		DmlChannels:     []string{suite.vchannel},
+		TotalChannelNum: 2,
+	}
+	suite.NoError(err)
+
+	rsp, err := suite.node.SearchSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(rsp.GetIsTopkReduce(), false)
+	suite.Equal(rsp.GetIsRecallEvaluation(), false)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+
+	req.Req, err = suite.genCSearchRequest(10, schemapb.DataType_FloatVector, 107, defaultMetricType, true, true)
+	suite.NoError(err)
+	rsp, err = suite.node.SearchSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(rsp.GetIsTopkReduce(), true)
+	suite.Equal(rsp.GetIsRecallEvaluation(), true)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestStreamingSearch() {
+	ctx := context.Background()
+	// pre
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.UseStreamComputing.Key, "true")
+	creq, err := suite.genCSearchRequest(10, schemapb.DataType_FloatVector, 107, defaultMetricType, false, true)
+	req := &querypb.SearchRequest{
+		Req:             creq,
+		FromShardLeader: true,
+		DmlChannels:     []string{suite.vchannel},
+		TotalChannelNum: 2,
+		SegmentIDs:      suite.validSegmentIDs,
+		Scope:           querypb.DataScope_Historical,
+	}
+	suite.NoError(err)
+
+	rsp, err := suite.node.SearchSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(false, rsp.GetIsTopkReduce())
+	suite.Equal(true, rsp.GetIsRecallEvaluation())
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestStreamingSearchGrowing() {
+	ctx := context.Background()
+	// pre
+	suite.TestWatchDmChannelsInt64()
+	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.UseStreamComputing.Key, "true")
+	creq, err := suite.genCSearchRequest(10, schemapb.DataType_FloatVector, 107, defaultMetricType, false, false)
+	req := &querypb.SearchRequest{
+		Req:             creq,
+		FromShardLeader: true,
+		DmlChannels:     []string{suite.vchannel},
+		TotalChannelNum: 2,
+		Scope:           querypb.DataScope_Streaming,
+	}
+	suite.NoError(err)
+
+	rsp, err := suite.node.SearchSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+// Test Query
+func (suite *ServiceSuite) genCQueryRequest(nq int64, indexType string, schema *schemapb.CollectionSchema) (*internalpb.RetrieveRequest, error) {
+	expr, err := genSimpleRetrievePlanExpr(schema)
+	if err != nil {
+		return nil, err
+	}
+
+	return &internalpb.RetrieveRequest{
+		QueryLabel: "query",
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_Retrieve,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+		// 106 is fieldID of int64 pk
+		OutputFieldsId:     []int64{106, 100},
+		SerializedExprPlan: expr,
+	}, nil
+}
+
+func (suite *ServiceSuite) TestQuery_Normal() {
+	ctx := context.Background()
+	// pre
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	suite.syncDistribution(ctx)
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.NoError(err)
+	req := &querypb.QueryRequest{
+		Req: creq,
+
+		DmlChannels: []string{suite.vchannel},
+	}
+
+	rsp, err := suite.node.Query(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestQuery_Failed() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	suite.node.manager.Collection.PutOrRef(suite.collectionID, schema, nil, nil)
+	defer suite.node.manager.Collection.Unref(suite.collectionID, 1)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.NoError(err)
+	req := &querypb.QueryRequest{
+		Req: creq,
+
+		DmlChannels: []string{suite.vchannel},
+	}
+
+	// Delegator not found
+	resp, err := suite.node.Query(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(resp.GetStatus()), merr.ErrChannelNotFound)
+
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	resp, err = suite.node.Query(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, resp.Status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestMaterialize_Failed() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.NoError(err)
+	creq.Limit = typeutil.Unlimited
+	req := &querypb.QueryRequest{
+		Req:                      creq,
+		DmlChannels:              []string{suite.vchannel},
+		MaterializeFormatVersion: materialize.FormatVersion,
+	}
+
+	// collection not loaded
+	resp, err := suite.node.Materialize(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(resp.GetStatus()), merr.ErrCollectionNotLoaded)
+
+	suite.node.manager.Collection.PutOrRef(suite.collectionID, schema, nil, nil)
+	defer suite.node.manager.Collection.Unref(suite.collectionID, 1)
+
+	// delegator not found
+	resp, err = suite.node.Materialize(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(resp.GetStatus()), merr.ErrChannelNotFound)
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	resp, err = suite.node.Materialize(ctx, req)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
+}
+
+func (suite *ServiceSuite) TestMaterializeSegments_RejectsOutOfScope() {
+	unlimited := func() *internalpb.RetrieveRequest {
+		return &internalpb.RetrieveRequest{CollectionID: suite.collectionID, Limit: typeutil.Unlimited}
+	}
+	cases := []struct {
+		name    string
+		version int32
+		mutate  func(*internalpb.RetrieveRequest)
+	}{
+		{"limited", materialize.FormatVersion, func(r *internalpb.RetrieveRequest) { r.Limit = 10 }},
+		{"aggregate", materialize.FormatVersion, func(r *internalpb.RetrieveRequest) { r.Aggregates = []*planpb.Aggregate{{}} }},
+		{"group by", materialize.FormatVersion, func(r *internalpb.RetrieveRequest) { r.GroupByFieldIds = []int64{101} }},
+		{"order by", materialize.FormatVersion, func(r *internalpb.RetrieveRequest) { r.OrderByFields = []*planpb.OrderByField{{}} }},
+		{"no format version", 0, func(*internalpb.RetrieveRequest) {}},
+		{"newer format version", materialize.FormatVersion + 1, func(*internalpb.RetrieveRequest) {}},
+	}
+	for _, c := range cases {
+		suite.Run(c.name, func() {
+			r := unlimited()
+			c.mutate(r)
+			res, err := suite.node.MaterializeSegments(context.Background(), &querypb.QueryRequest{
+				Req:                      r,
+				DmlChannels:              []string{suite.vchannel},
+				MaterializeFormatVersion: c.version,
+			})
+			suite.NoError(err)
+			// Out of scope, not broken: the proxy falls back to Query.
+			suite.ErrorIs(merr.Error(res.GetStatus()), merr.ErrServiceUnimplemented)
+			// The reply names this node's version, so a mismatch is told apart.
+			suite.Equal(materialize.FormatVersion, res.GetHeader().GetFormatVersion())
+		})
+	}
+}
+
+func (suite *ServiceSuite) TestMaterialize_Normal() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	suite.syncDistribution(ctx)
+
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.Require().NoError(err)
+	creq.MvccTimestamp = typeutil.MaxTimestamp
+	creq.Limit = typeutil.Unlimited
+	creq.OutputFieldsId = []int64{109, 100, common.TimeStampField}
+	planNode := &planpb.PlanNode{}
+	suite.Require().NoError(proto.Unmarshal(creq.SerializedExprPlan, planNode))
+	planNode.OutputFieldIds = []int64{109, 100, common.TimeStampField}
+	creq.SerializedExprPlan, err = proto.Marshal(planNode)
+	suite.Require().NoError(err)
+
+	res, err := suite.node.Materialize(ctx, &querypb.QueryRequest{
+		Req:                      creq,
+		MaterializeFormatVersion: materialize.FormatVersion,
+		DmlChannels:              []string{suite.vchannel},
+	})
+	suite.Require().NoError(err)
+	suite.Require().NoError(merr.Error(res.GetStatus()))
+	suite.Greater(res.GetHeader().GetBodyRawSize(), int64(0))
+	// The delegator relays the body through the side table, not res.Body.
+	body := resource.TakeMaterializeBody(res)
+	defer body.Release()
+	suite.Greater(body.Len(), 0)
+	// The request named no schema, so the reply carries the bytes.
+	suite.NotEmpty(res.GetHeader().GetBodySchema())
+	suite.Equal(materialize.SchemaFingerprint(res.GetHeader().GetBodySchema()), res.GetHeader().GetSchemaFingerprint())
+	suite.Equal(typeutil.MaxTimestamp, res.GetHeader().GetMvccTimestamp())
+}
+
+func (suite *ServiceSuite) TestMaterializeSegments_MatchesQuerySegments() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.Require().NoError(err)
+	creq.MvccTimestamp = typeutil.MaxTimestamp
+	creq.Limit = typeutil.Unlimited
+	// Like the real proxy, request the timestamp in both the request and the
+	// serialized plan; otherwise segcore force-retains the pk in the header.
+	creq.OutputFieldsId = []int64{109, 100, common.TimeStampField}
+	planNode := &planpb.PlanNode{}
+	suite.Require().NoError(proto.Unmarshal(creq.SerializedExprPlan, planNode))
+	planNode.OutputFieldIds = []int64{109, 100, common.TimeStampField}
+	// Match every row, so the comparison covers many rows across segments.
+	planNode.Node = &planpb.PlanNode_Predicates{Predicates: &planpb.Expr{Expr: &planpb.Expr_UnaryRangeExpr{UnaryRangeExpr: &planpb.UnaryRangeExpr{
+		ColumnInfo: &planpb.ColumnInfo{FieldId: 109, DataType: schemapb.DataType_Int64},
+		Op:         planpb.OpType_GreaterEqual,
+		Value:      &planpb.GenericValue{Val: &planpb.GenericValue_Int64Val{Int64Val: 0}},
+	}}}}
+	creq.SerializedExprPlan, err = proto.Marshal(planNode)
+	suite.Require().NoError(err)
+	req := &querypb.QueryRequest{
+		Req:                      creq,
+		MaterializeFormatVersion: materialize.FormatVersion,
+		DmlChannels:              []string{suite.vchannel},
+		SegmentIDs:               suite.validSegmentIDs,
+		Scope:                    querypb.DataScope_Historical,
+	}
+
+	qres, err := suite.node.QuerySegments(ctx, req)
+	suite.Require().NoError(err)
+	suite.Require().NoError(merr.Error(qres.GetStatus()))
+	wantRows := int64(typeutil.GetSizeOfIDs(qres.GetIds()))
+	suite.Require().Greater(wantRows, int64(0))
+
+	mreq := proto.Clone(req).(*querypb.QueryRequest)
+	mres, err := suite.node.MaterializeSegments(ctx, mreq)
+	suite.Require().NoError(err)
+	suite.Require().NoError(merr.Error(mres.GetStatus()))
+
+	suite.Greater(mres.GetHeader().GetBodyRawSize(), int64(0))
+	// Without a fingerprint in the request the reply carries the schema bytes;
+	// with the matching one it omits them; with another it carries them.
+	schemaMsg := mres.GetHeader().GetBodySchema()
+	fp := mres.GetHeader().GetSchemaFingerprint()
+	suite.Require().NotEmpty(schemaMsg)
+	suite.Equal(materialize.SchemaFingerprint(schemaMsg), fp)
+	for _, c := range []struct {
+		name      string
+		requestFP uint64
+		wantBytes bool
+	}{
+		{"matching fingerprint", fp, false},
+		{"other fingerprint", fp + 1, true},
+	} {
+		freq := proto.Clone(mreq).(*querypb.QueryRequest)
+		freq.MaterializeSchemaFingerprint = c.requestFP
+		fres, err := suite.node.MaterializeSegments(ctx, freq)
+		suite.Require().NoError(err, c.name)
+		suite.Require().NoError(merr.Error(fres.GetStatus()), c.name)
+		suite.NotEmpty(fres.GetBody(), c.name)
+		suite.Equal(fp, fres.GetHeader().GetSchemaFingerprint(), c.name)
+		if c.wantBytes {
+			suite.Equal(schemaMsg, fres.GetHeader().GetBodySchema(), c.name)
+		} else {
+			suite.Empty(fres.GetHeader().GetBodySchema(), c.name)
+		}
+		// arrow-go's stock reader is the oracle.
+		rd, err := ipc.NewReader(io.MultiReader(bytes.NewReader(schemaMsg), bytes.NewReader(bytes.Join(fres.GetBody(), nil))))
+		suite.Require().NoError(err, c.name)
+		n := int64(0)
+		for rd.Next() {
+			n += rd.Record().NumRows()
+		}
+		suite.Require().NoError(rd.Err(), c.name)
+		rd.Release()
+		suite.Equal(wantRows, n, c.name)
+	}
+	// Turn the batches back into FieldData the way the proxy does
+	// (materialize.Schema.ReadEntry, then Gather), then compare pk values and
+	// every column with Query's, both ordered by pk.
+	ms, err := materialize.ParseSchema(mres.GetHeader().GetBodySchema())
+	suite.Require().NoError(err)
+	var (
+		batches []*materialize.Batch
+		rows    []materialize.RowRef
+	)
+	for i, e := range mres.GetBody() {
+		b, err := ms.ReadEntry([][]byte{e}, i, 0)
+		suite.Require().NoError(err)
+		// The timestamp is the batch's system column.
+		suite.Require().Len(b.Sys, 1)
+		suite.Require().Len(b.Timestamps(ms), b.Rows)
+		batches = append(batches, b)
+		for j := 0; j < b.Rows; j++ {
+			rows = append(rows, materialize.RowRef{Batch: int32(i), Row: int32(j)})
+		}
+	}
+	suite.Equal(wantRows, int64(len(rows)))
+	helper, err := typeutil.CreateSchemaHelper(schema)
+	suite.Require().NoError(err)
+	ids, fields, err := ms.Gather(batches, rows, helper)
+	suite.Require().NoError(err)
+	mseg := &segcorepb.RetrieveResults{Ids: ids, FieldsData: fields}
+
+	sortByPK := func(ids []int64, fields []*schemapb.FieldData) ([]int64, map[int64]*schemapb.FieldData) {
+		order := make([]int, len(ids))
+		for i := range order {
+			order[i] = i
+		}
+		sort.Slice(order, func(a, b int) bool { return ids[order[a]] < ids[order[b]] })
+		sortedIDs := make([]int64, len(ids))
+		dst := typeutil.PrepareResultFieldData(fields, int64(len(ids)))
+		for i, o := range order {
+			sortedIDs[i] = ids[o]
+			typeutil.AppendFieldData(dst, fields, int64(o))
+		}
+		byID := make(map[int64]*schemapb.FieldData, len(dst))
+		for _, fd := range dst {
+			byID[fd.GetFieldId()] = fd
+		}
+		return sortedIDs, byID
+	}
+	wantPKs, wantCols := sortByPK(qres.GetIds().GetIntId().GetData(), qres.GetFieldsData())
+	gotPKs, gotCols := sortByPK(mseg.GetIds().GetIntId().GetData(), mseg.GetFieldsData())
+	suite.Equal(wantPKs, gotPKs)
+	suite.Require().NotEmpty(wantCols)
+	suite.Equal(len(wantCols), len(gotCols))
+	for id, want := range wantCols {
+		got, ok := gotCols[id]
+		suite.Require().True(ok, "field %d missing from Materialize", id)
+		suite.Equal(want.GetType(), got.GetType(), "field %d", id)
+		suite.True(proto.Equal(want.GetScalars(), got.GetScalars()), "field %d scalars differ", id)
+		suite.True(proto.Equal(want.GetVectors(), got.GetVectors()), "field %d vectors differ", id)
+		suite.Equal(want.GetValidData(), got.GetValidData(), "field %d valid data", id)
+	}
+
+	// A collection that is not loaded surfaces as a header status, not an error.
+	mreq.Req.CollectionID = -1
+	mres, err = suite.node.MaterializeSegments(ctx, mreq)
+	suite.NoError(err)
+	suite.ErrorIs(merr.Error(mres.GetStatus()), merr.ErrCollectionNotLoaded)
+}
+
+func (suite *ServiceSuite) TestQuerySegments_Failed() {
+	ctx := context.Background()
+
+	req := &querypb.QueryRequest{
+		Req: &internalpb.RetrieveRequest{
+			QueryLabel:   "query",
+			CollectionID: -1,
+		},
+
+		DmlChannels: []string{suite.vchannel},
+	}
+
+	rsp, err := suite.node.QuerySegments(ctx, req)
+	suite.NoError(err)
+
+	suite.Equal(commonpb.ErrorCode_UnexpectedError, rsp.GetStatus().GetErrorCode())
+	suite.Equal(merr.Code(merr.ErrCollectionNotLoaded), rsp.GetStatus().GetCode())
+
+	suite.TestWatchDmChannelsInt64()
+
+	req.Req.CollectionID = suite.collectionID
+
+	ctx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	rsp, err = suite.node.QuerySegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_UnexpectedError, rsp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestQueryStream_Normal() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// prepare
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	suite.syncDistribution(ctx)
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.NoError(err)
+	req := &querypb.QueryRequest{
+		Req: creq,
+
+		DmlChannels: []string{suite.vchannel},
+	}
+
+	client := streamrpc.NewLocalQueryClient(ctx)
+	server := client.CreateServer()
+
+	go func() {
+		err := suite.node.QueryStream(req, server)
+		suite.NoError(err)
+		server.FinishSend(err)
+	}()
+
+	for {
+		result, err := client.Recv()
+		if err == io.EOF {
+			break
+		}
+		suite.NoError(err)
+
+		err = merr.Error(result.GetStatus())
+		suite.NoError(err)
+	}
+}
+
+func (suite *ServiceSuite) TestQueryStream_Failed() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.NoError(err)
+	req := &querypb.QueryRequest{
+		Req: creq,
+
+		DmlChannels: []string{suite.vchannel},
+	}
+
+	queryFunc := func(wg *sync.WaitGroup, req *querypb.QueryRequest, client *streamrpc.LocalQueryClient) {
+		server := client.CreateServer()
+
+		defer wg.Done()
+		err := suite.node.QueryStream(req, server)
+		suite.NoError(err)
+		server.FinishSend(err)
+	}
+
+	// Delegator not found
+	suite.Run("delegator not found", func() {
+		client := streamrpc.NewLocalQueryClient(ctx)
+		wg := &sync.WaitGroup{}
+		wg.Add(1)
+		go queryFunc(wg, req, client)
+
+		for {
+			result, err := client.Recv()
+			if err == io.EOF {
+				break
+			}
+			suite.NoError(err)
+
+			err = merr.Error(result.GetStatus())
+			// Check result
+			if err != nil {
+				suite.ErrorIs(err, merr.ErrChannelNotFound)
+			}
+		}
+		wg.Wait()
+	})
+
+	// prepare
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	// node not healthy
+	suite.Run("node not healthy", func() {
+		suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+		client := streamrpc.NewLocalQueryClient(ctx)
+		wg := &sync.WaitGroup{}
+		wg.Add(1)
+		go queryFunc(wg, req, client)
+
+		for {
+			result, err := client.Recv()
+			if err == io.EOF {
+				break
+			}
+			suite.NoError(err)
+
+			err = merr.Error(result.GetStatus())
+			if err != nil {
+				suite.True(errors.Is(err, merr.ErrServiceNotReady))
+			}
+		}
+		wg.Wait()
+	})
+}
+
+func (suite *ServiceSuite) TestQuerySegments_Normal() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// pre
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.NoError(err)
+	req := &querypb.QueryRequest{
+		Req: creq,
+
+		DmlChannels: []string{suite.vchannel},
+	}
+
+	rsp, err := suite.node.QuerySegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, rsp.GetStatus().GetErrorCode())
+}
+
+// genCountRequest builds count(*) on the collection the suite loaded.
+// legacy=true is the 2.6 Proxy encoding: IsCount on the request, is_count on
+// the plan, no Aggregates. legacy=false is the current encoding: one count
+// aggregate on the request and on the plan.
+func (suite *ServiceSuite) genCountRequest(legacy bool) *querypb.QueryRequest {
+	countAll := []*planpb.Aggregate{{Op: planpb.AggregateOp_count, FieldId: 0}}
+	query := &planpb.QueryPlanNode{}
+	req := &internalpb.RetrieveRequest{
+		QueryLabel: "query",
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_Retrieve,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID:  suite.collectionID,
+		PartitionIDs:  suite.partitionIDs,
+		Limit:         typeutil.Unlimited,
+		MvccTimestamp: typeutil.MaxTimestamp,
+	}
+	if legacy {
+		query.IsCount = true
+		req.IsCount = true
+	} else {
+		query.Aggregates = countAll
+		req.Aggregates = countAll
+	}
+	serialized, err := proto.Marshal(&planpb.PlanNode{Node: &planpb.PlanNode_Query{Query: query}})
+	suite.Require().NoError(err)
+	req.SerializedExprPlan = serialized
+	return &querypb.QueryRequest{
+		Req:         req,
+		DmlChannels: []string{suite.vchannel},
+	}
+}
+
+// countOf reads the single value of a count(*) result in the shape a 2.6
+// Proxy requires: exactly one Int64 column with one row.
+func (suite *ServiceSuite) countOf(rsp *internalpb.RetrieveResults) int64 {
+	suite.Require().NoError(merr.Error(rsp.GetStatus()))
+	suite.Require().Len(rsp.GetFieldsData(), 1)
+	suite.Require().Equal(schemapb.DataType_Int64, rsp.GetFieldsData()[0].GetType())
+	counts := rsp.GetFieldsData()[0].GetScalars().GetLongData().GetData()
+	suite.Require().Len(counts, 1)
+	return counts[0]
+}
+
+// TestQuery_LegacyCount is a 2.6 Proxy that sends count(*) to this node's
+// delegator during a rolling upgrade. The answer must equal the answer to the
+// same count(*) in the current encoding.
+// The two legacy count tests cover the paths that enter this node: a 2.6
+// Proxy that sends to a 3.0 delegator, and a 2.6 delegator that sends to a 3.0
+// worker. The third mixed-version path, a 3.0 delegator that forwards to a 2.6
+// worker, is not run here: it requires a 2.6 worker binary. That path was
+// traced by code: the forwarded plan keeps is_count, the 2.6 worker answers
+// with one Int64 column and no Ids, and the delegator aggregate reduce accepts
+// that shape (TestDelegatorPipelineCountWithEmptyWorkerResult).
+func (suite *ServiceSuite) TestQuery_LegacyCount() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	suite.syncDistribution(ctx)
+
+	current, err := suite.node.Query(ctx, suite.genCountRequest(false))
+	suite.Require().NoError(err)
+	expected := suite.countOf(current)
+	suite.Require().Positive(expected)
+
+	legacy, err := suite.node.Query(ctx, suite.genCountRequest(true))
+	suite.Require().NoError(err)
+	suite.Equal(expected, suite.countOf(legacy))
+}
+
+// TestQuerySegments_LegacyCount is a 2.6 delegator that forwards count(*) to
+// this node as a worker during a rolling upgrade.
+func (suite *ServiceSuite) TestQuerySegments_LegacyCount() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	querySegments := func(legacy bool) *internalpb.RetrieveResults {
+		req := suite.genCountRequest(legacy)
+		req.SegmentIDs = suite.validSegmentIDs
+		req.Scope = querypb.DataScope_Historical
+		rsp, err := suite.node.QuerySegments(ctx, req)
+		suite.Require().NoError(err)
+		return rsp
+	}
+
+	expected := suite.countOf(querySegments(false))
+	suite.Require().Positive(expected)
+	suite.Equal(expected, suite.countOf(querySegments(true)))
+}
+
+func (suite *ServiceSuite) TestQueryStreamSegments_Normal() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// pre
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	creq, err := suite.genCQueryRequest(10, IndexFaissIDMap, schema)
+	suite.NoError(err)
+	req := &querypb.QueryRequest{
+		Req: creq,
+
+		DmlChannels: []string{suite.vchannel},
+	}
+
+	client := streamrpc.NewLocalQueryClient(ctx)
+	server := client.CreateServer()
+
+	go func() {
+		err := suite.node.QueryStreamSegments(req, server)
+		suite.NoError(err)
+		server.FinishSend(err)
+	}()
+
+	for {
+		result, err := client.Recv()
+		if err == io.EOF {
+			break
+		}
+		suite.NoError(err)
+
+		err = merr.Error(result.GetStatus())
+		suite.NoError(err)
+		// Check result
+		if !errors.Is(err, nil) {
+			suite.NoError(err)
+			break
+		}
+	}
+}
+
+func (suite *ServiceSuite) TestSyncReplicaSegments_Normal() {
+	ctx := context.Background()
+	req := &querypb.SyncReplicaSegmentsRequest{}
+	status, err := suite.node.SyncReplicaSegments(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+}
+
+func (suite *ServiceSuite) TestShowConfigurations_Normal() {
+	ctx := context.Background()
+	req := &internalpb.ShowConfigurationsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		Pattern: "mmap.growingMmapEnabled",
+	}
+
+	resp, err := suite.node.ShowConfigurations(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	suite.Equal(1, len(resp.Configuations))
+}
+
+func (suite *ServiceSuite) TestShowConfigurations_Failed() {
+	ctx := context.Background()
+	req := &internalpb.ShowConfigurationsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		Pattern: "mmap.growingMmapEnabled",
+	}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	resp, err := suite.node.ShowConfigurations(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, resp.Status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetMetric_Normal() {
+	ctx := context.Background()
+	req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
+	suite.NoError(err)
+
+	sd1 := delegator.NewMockShardDelegator(suite.T())
+	sd1.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
+	sd1.EXPECT().Collection().Return(100)
+	sd1.EXPECT().GetDeleteBufferSize().Return(10, 1000)
+	sd1.EXPECT().GetTSafe().Return(100)
+	sd1.EXPECT().Close().Maybe()
+	suite.node.delegators.Insert("qn_unitest_dml_0_100v0", sd1)
+	defer suite.node.delegators.GetAndRemove("qn_unitest_dml_0_100v0")
+
+	sd2 := delegator.NewMockShardDelegator(suite.T())
+	sd2.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
+	sd2.EXPECT().Collection().Return(100)
+	sd2.EXPECT().GetTSafe().Return(200)
+	sd2.EXPECT().GetDeleteBufferSize().Return(10, 1000)
+	sd2.EXPECT().Close().Maybe()
+	suite.node.delegators.Insert("qn_unitest_dml_1_100v1", sd2)
+	defer suite.node.delegators.GetAndRemove("qn_unitest_dml_1_100v1")
+
+	resp, err := suite.node.GetMetrics(ctx, req)
+	err = merr.CheckRPCCall(resp, err)
+	suite.NoError(err)
+
+	info := &metricsinfo.QueryNodeInfos{}
+	err = metricsinfo.UnmarshalComponentInfos(resp.GetResponse(), info)
+	suite.NoError(err)
+
+	entryNum, ok := info.QuotaMetrics.DeleteBufferInfo.CollectionDeleteBufferNum[100]
+	suite.True(ok)
+	suite.EqualValues(20, entryNum)
+	memorySize, ok := info.QuotaMetrics.DeleteBufferInfo.CollectionDeleteBufferSize[100]
+	suite.True(ok)
+	suite.EqualValues(2000, memorySize)
+}
+
+func (suite *ServiceSuite) TestGetMetric_Failed() {
+	ctx := context.Background()
+	// invalid metric type
+	metricReq := make(map[string]string)
+	metricReq[metricsinfo.MetricTypeKey] = "invalidType"
+	mReq, err := json.Marshal(metricReq)
+	suite.NoError(err)
+
+	req := &milvuspb.GetMetricsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		Request: string(mReq),
+	}
+
+	resp, err := suite.node.GetMetrics(ctx, req)
+	suite.NoError(err)
+	err = merr.Error(resp.GetStatus())
+	suite.Contains(err.Error(), metricsinfo.MsgUnimplementedMetric)
+
+	// metric parse failed
+	req.Request = "---"
+	resp, err = suite.node.GetMetrics(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_IllegalArgument, resp.GetStatus().GetErrorCode())
+
+	// node unhealthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	resp, err = suite.node.GetMetrics(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, resp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_Normal() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	req := &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+	}
+
+	resp, err := suite.node.GetDataDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_Failed() {
+	ctx := context.Background()
+	req := &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+	}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	resp, err := suite.node.GetDataDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, resp.Status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_LeaderViewStatus() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	req := &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+	}
+
+	resp, err := suite.node.GetDataDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+
+	// Verify LeaderView has Status field with CatchingUpStreamingData
+	suite.NotEmpty(resp.LeaderViews)
+	for _, leaderView := range resp.LeaderViews {
+		suite.NotNil(leaderView.Status, "LeaderView should have Status field")
+		// Initially delegator is catching up streaming data (true)
+		suite.True(leaderView.Status.CatchingUpStreamingData,
+			"New delegator should be catching up streaming data")
+	}
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_DeltaReportsStreamingDataCaughtUp() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+
+	fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotZero(fullResp.GetLastModifyTs())
+
+	shardDelegator, ok := suite.node.delegators.Get(suite.vchannel)
+	suite.Require().True(ok)
+	suite.Require().True(shardDelegator.CatchingUpStreamingData())
+
+	time.Sleep(time.Nanosecond)
+	shardDelegator.UpdateTSafe(tsoutil.ComposeTSByTime(time.Now()))
+
+	deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Require().Len(deltaResp.GetLeaderViews(), 1)
+	suite.Equal(suite.vchannel, deltaResp.GetLeaderViews()[0].GetChannel())
+	suite.False(deltaResp.GetLeaderViews()[0].GetStatus().GetCatchingUpStreamingData())
+}
+
+func (suite *ServiceSuite) getDataDistributionWithDeltaSupport(ctx context.Context, lastUpdateTs int64) *querypb.GetDataDistributionResponse {
+	resp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		LastUpdateTs: lastUpdateTs,
+		SupportDelta: true,
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	return resp
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_DeltaReportsFailedLeaderSegmentRelease() {
+	ctx := context.Background()
+	channel := "failed-release-delta-channel"
+	segmentID := int64(10001)
+	nodeID := paramtable.GetNodeID()
+	mockDelegator := delegator.NewMockShardDelegator(suite.T())
+	mockDelegator.EXPECT().Serviceable().Return(true).Maybe()
+	mockDelegator.EXPECT().Collection().Return(suite.collectionID).Maybe()
+	mockDelegator.EXPECT().Version().Return(int64(1)).Maybe()
+	mockDelegator.EXPECT().GetSegmentInfo(false).Return(
+		[]delegator.SnapshotItem{
+			{
+				NodeID: nodeID,
+				Segments: []delegator.SegmentEntry{
+					{SegmentID: segmentID, NodeID: nodeID, Version: 1},
+				},
+			},
+		},
+		nil,
+	).Maybe()
+	mockDelegator.EXPECT().GetChannelQueryView().Return(delegator.NewChannelQueryView(nil, nil, nil, 1)).Maybe()
+	mockDelegator.EXPECT().GetPartitionStatsVersions(mock.Anything).Return(nil).Maybe()
+	mockDelegator.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
+	mockDelegator.EXPECT().ReleaseSegments(mock.Anything, mock.AnythingOfType("*querypb.ReleaseSegmentsRequest"), false).
+		Return(errors.New("mocked error"))
+	suite.node.delegators.Insert(channel, mockDelegator)
+	defer suite.node.delegators.GetAndRemove(channel)
+
+	suite.node.updateDistributionModifyTS()
+	fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotEmpty(fullResp.GetLeaderViews())
+
+	status, err := suite.node.ReleaseSegments(ctx, &querypb.ReleaseSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		Shard:        channel,
+		CollectionID: suite.collectionID,
+		SegmentIDs:   []int64{segmentID},
+		NeedTransfer: true,
+		Scope:        querypb.DataScope_Historical,
+		NodeID:       nodeID,
+	})
+	suite.Require().NoError(err)
+	suite.Require().NotEqual(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Require().Len(deltaResp.GetLeaderViews(), 1)
+	suite.Equal(channel, deltaResp.GetLeaderViews()[0].GetChannel())
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_DeltaReportsFailedLeaderSegmentLoad() {
+	ctx := context.Background()
+	channel := "failed-load-delta-channel"
+	segmentID := int64(10001)
+	nodeID := paramtable.GetNodeID()
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	mockDelegator := delegator.NewMockShardDelegator(suite.T())
+	mockDelegator.EXPECT().Serviceable().Return(true).Maybe()
+	mockDelegator.EXPECT().Collection().Return(suite.collectionID).Maybe()
+	mockDelegator.EXPECT().Version().Return(int64(1)).Maybe()
+	mockDelegator.EXPECT().GetSegmentInfo(false).Return(nil, nil).Maybe()
+	mockDelegator.EXPECT().GetChannelQueryView().Return(delegator.NewChannelQueryView(nil, nil, nil, 1)).Maybe()
+	mockDelegator.EXPECT().GetPartitionStatsVersions(mock.Anything).Return(nil).Maybe()
+	mockDelegator.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
+	mockDelegator.EXPECT().LoadSegments(mock.Anything, mock.AnythingOfType("*querypb.LoadSegmentsRequest")).
+		Return(errors.New("mocked error"))
+	suite.node.delegators.Insert(channel, mockDelegator)
+	defer suite.node.delegators.GetAndRemove(channel)
+
+	suite.node.updateDistributionModifyTS()
+	fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotZero(fullResp.GetLastModifyTs())
+
+	status, err := suite.node.LoadSegments(ctx, &querypb.LoadSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		DstNodeID:    nodeID,
+		NeedTransfer: true,
+		LoadScope:    querypb.LoadScope_Full,
+		Schema:       schema,
+		IndexInfoList: mock_segcore.GenTestIndexInfoList(
+			suite.collectionID,
+			schema,
+		),
+		Infos: []*querypb.SegmentLoadInfo{
+			{
+				SegmentID:     segmentID,
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionIDs[0],
+				InsertChannel: channel,
+			},
+		},
+	})
+	suite.Require().NoError(err)
+	suite.Require().NotEqual(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Require().Len(deltaResp.GetLeaderViews(), 1)
+	suite.Equal(channel, deltaResp.GetLeaderViews()[0].GetChannel())
+}
+
+func TestLeaderViewCatchingUpStreamingData(t *testing.T) {
+	t.Run("legacy querynode preserves catchup state", func(t *testing.T) {
+		assert.True(t, leaderViewCatchingUpStreamingData(nil, true))
+		assert.False(t, leaderViewCatchingUpStreamingData(nil, false))
+	})
+
+	t.Run("embedded querynode does not report legacy catchup", func(t *testing.T) {
+		labels := map[string]string{sessionutil.LabelStreamingNodeEmbeddedQueryNode: "1"}
+		assert.False(t, leaderViewCatchingUpStreamingData(labels, true))
+		assert.False(t, leaderViewCatchingUpStreamingData(labels, false))
+	})
+
+	t.Run("legacy embedded querynode label is honored", func(t *testing.T) {
+		labels := map[string]string{sessionutil.LegacyLabelStreamingNodeEmbeddedQueryNode: "1"}
+		assert.False(t, leaderViewCatchingUpStreamingData(labels, true))
+	})
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_Normal() {
+	ctx := context.Background()
+	// prepare
+	// watch dmchannel and load some segments
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	// data
+	req := &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      suite.vchannel,
+	}
+
+	releaseAction := &querypb.SyncAction{
+		Type:      querypb.SyncType_Remove,
+		SegmentID: suite.validSegmentIDs[0],
+	}
+
+	setAction := &querypb.SyncAction{
+		Type:        querypb.SyncType_Set,
+		SegmentID:   suite.validSegmentIDs[0],
+		NodeID:      0,
+		PartitionID: suite.partitionIDs[0],
+	}
+
+	req.Actions = []*querypb.SyncAction{releaseAction, setAction}
+	status, err := suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+
+	// test sync targte version
+	syncVersionAction := &querypb.SyncAction{
+		Type:            querypb.SyncType_UpdateVersion,
+		SealedInTarget:  []int64{3},
+		GrowingInTarget: []int64{4},
+		DroppedInTarget: []int64{1, 2},
+		TargetVersion:   time.Now().UnixMilli(),
+	}
+
+	req.Actions = []*querypb.SyncAction{syncVersionAction}
+	status, err = suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	// test sync segments
+	segmentVersion := int64(111)
+	syncSegmentVersion := &querypb.SyncAction{
+		Type:        querypb.SyncType_Set,
+		SegmentID:   suite.validSegmentIDs[0],
+		NodeID:      0,
+		PartitionID: suite.partitionIDs[0],
+		Info:        &querypb.SegmentLoadInfo{},
+		Version:     segmentVersion,
+	}
+	req.Actions = []*querypb.SyncAction{syncSegmentVersion}
+
+	testChannel := "test_sync_segment"
+	req.Channel = testChannel
+
+	// expected call load segment with right segment version
+	var versionMatch bool
+	mockDelegator := delegator.NewMockShardDelegator(suite.T())
+	mockDelegator.EXPECT().LoadSegments(mock.Anything, mock.Anything).
+		RunAndReturn(func(ctx context.Context, req *querypb.LoadSegmentsRequest) error {
+			mlog.Info(context.TODO(), "version", mlog.Int64("versionInload", req.GetVersion()))
+			versionMatch = req.GetVersion() == segmentVersion
+			return nil
+		})
+	suite.node.delegators.Insert(testChannel, mockDelegator)
+	defer suite.node.delegators.GetAndRemove(testChannel)
+
+	status, err = suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+	suite.True(versionMatch)
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_PartialSetFailureReportsLeaderViewDelta() {
+	ctx := context.Background()
+	channel := "partial-set-failure-delta-channel"
+	nodeID := paramtable.GetNodeID()
+	loadedSegmentID := int64(10001)
+	failedSegmentID := int64(10002)
+	mockDelegator := delegator.NewMockShardDelegator(suite.T())
+	mockDelegator.EXPECT().Serviceable().Return(true).Maybe()
+	mockDelegator.EXPECT().Collection().Return(suite.collectionID).Maybe()
+	mockDelegator.EXPECT().Version().Return(int64(1)).Maybe()
+	mockDelegator.EXPECT().GetSegmentInfo(false).Return(
+		[]delegator.SnapshotItem{
+			{
+				NodeID: nodeID,
+				Segments: []delegator.SegmentEntry{
+					{SegmentID: loadedSegmentID, NodeID: nodeID, Version: 1},
+				},
+			},
+		},
+		nil,
+	).Maybe()
+	mockDelegator.EXPECT().GetChannelQueryView().Return(delegator.NewChannelQueryView(nil, nil, nil, 1)).Maybe()
+	mockDelegator.EXPECT().GetPartitionStatsVersions(mock.Anything).Return(nil).Maybe()
+	mockDelegator.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
+	mockDelegator.EXPECT().LoadSegments(mock.Anything, mock.AnythingOfType("*querypb.LoadSegmentsRequest")).
+		RunAndReturn(func(ctx context.Context, req *querypb.LoadSegmentsRequest) error {
+			if req.GetInfos()[0].GetSegmentID() == failedSegmentID {
+				return errors.New("mocked load failure")
+			}
+			return nil
+		})
+	suite.node.delegators.Insert(channel, mockDelegator)
+	defer suite.node.delegators.GetAndRemove(channel)
+
+	suite.node.updateDistributionModifyTS()
+	fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotZero(fullResp.GetLastModifyTs())
+
+	status, err := suite.node.SyncDistribution(ctx, &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      channel,
+		Actions: []*querypb.SyncAction{
+			{
+				Type:      querypb.SyncType_Set,
+				SegmentID: loadedSegmentID,
+				NodeID:    nodeID,
+				Version:   1,
+				Info: &querypb.SegmentLoadInfo{
+					SegmentID:    loadedSegmentID,
+					CollectionID: suite.collectionID,
+					PartitionID:  suite.partitionIDs[0],
+				},
+			},
+			{
+				Type:      querypb.SyncType_Set,
+				SegmentID: failedSegmentID,
+				NodeID:    nodeID,
+				Version:   1,
+				Info: &querypb.SegmentLoadInfo{
+					SegmentID:    failedSegmentID,
+					CollectionID: suite.collectionID,
+					PartitionID:  suite.partitionIDs[0],
+				},
+			},
+		},
+	})
+	suite.Require().NoError(err)
+	suite.Require().NotEqual(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Require().Len(deltaResp.GetLeaderViews(), 1)
+	suite.Equal(channel, deltaResp.GetLeaderViews()[0].GetChannel())
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_RemoveFailureAfterLeaderViewUpdateReportsDelta() {
+	ctx := context.Background()
+	channel := "remove-failure-after-leader-update-delta-channel"
+	partitionID := suite.partitionIDs[0]
+	partitionStatsVersion := int64(10001)
+	partitionStatsVersions := map[int64]int64{}
+	mockDelegator := delegator.NewMockShardDelegator(suite.T())
+	mockDelegator.EXPECT().Serviceable().Return(true).Maybe()
+	mockDelegator.EXPECT().Collection().Return(suite.collectionID).Maybe()
+	mockDelegator.EXPECT().Version().Return(int64(1)).Maybe()
+	mockDelegator.EXPECT().GetSegmentInfo(false).Return(nil, nil).Maybe()
+	mockDelegator.EXPECT().GetChannelQueryView().Return(delegator.NewChannelQueryView(nil, nil, nil, 1)).Maybe()
+	mockDelegator.EXPECT().GetPartitionStatsVersions(mock.Anything).RunAndReturn(func(context.Context) map[int64]int64 {
+		return partitionStatsVersions
+	}).Maybe()
+	mockDelegator.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
+	mockDelegator.EXPECT().SyncPartitionStats(mock.Anything, mock.Anything).Run(func(ctx context.Context, versions map[int64]int64) {
+		partitionStatsVersions = versions
+	}).Return()
+	mockDelegator.EXPECT().ReleaseSegments(mock.Anything, mock.AnythingOfType("*querypb.ReleaseSegmentsRequest"), true).
+		Return(errors.New("mocked release failure"))
+	suite.node.delegators.Insert(channel, mockDelegator)
+	defer suite.node.delegators.GetAndRemove(channel)
+
+	suite.node.updateDistributionModifyTS()
+	fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotZero(fullResp.GetLastModifyTs())
+
+	status, err := suite.node.SyncDistribution(ctx, &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      channel,
+		Actions: []*querypb.SyncAction{
+			{
+				Type:                   querypb.SyncType_UpdatePartitionStats,
+				PartitionStatsVersions: map[int64]int64{partitionID: partitionStatsVersion},
+			},
+			{
+				Type:      querypb.SyncType_Remove,
+				SegmentID: 10001,
+			},
+		},
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Require().Len(deltaResp.GetLeaderViews(), 1)
+	leaderView := deltaResp.GetLeaderViews()[0]
+	suite.Equal(channel, leaderView.GetChannel())
+	suite.Equal(partitionStatsVersion, leaderView.GetPartitionStatsVersions()[partitionID])
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_ErrorReportsLeaderViewDelta() {
+	ctx := context.Background()
+	channel := "sync-error-delta-channel"
+	mockDelegator := delegator.NewMockShardDelegator(suite.T())
+	mockDelegator.EXPECT().Serviceable().Return(true).Maybe()
+	mockDelegator.EXPECT().Collection().Return(suite.collectionID).Maybe()
+	mockDelegator.EXPECT().Version().Return(int64(1)).Maybe()
+	mockDelegator.EXPECT().GetSegmentInfo(false).Return(nil, nil).Maybe()
+	mockDelegator.EXPECT().GetChannelQueryView().Return(delegator.NewChannelQueryView(nil, nil, nil, 1)).Maybe()
+	mockDelegator.EXPECT().GetPartitionStatsVersions(mock.Anything).Return(nil).Maybe()
+	mockDelegator.EXPECT().CatchingUpStreamingData().Return(false).Maybe()
+	suite.node.delegators.Insert(channel, mockDelegator)
+	defer suite.node.delegators.GetAndRemove(channel)
+
+	suite.node.updateDistributionModifyTS()
+	fullResp := suite.getDataDistributionWithDeltaSupport(ctx, 0)
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotZero(fullResp.GetLastModifyTs())
+
+	status, err := suite.node.SyncDistribution(ctx, &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      channel,
+		Actions: []*querypb.SyncAction{
+			{
+				Type: querypb.SyncType(999),
+			},
+		},
+	})
+	suite.Require().NoError(err)
+	suite.Require().NotEqual(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	deltaResp := suite.getDataDistributionWithDeltaSupport(ctx, fullResp.GetLastModifyTs())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Require().Len(deltaResp.GetLeaderViews(), 1)
+	suite.Equal(channel, deltaResp.GetLeaderViews()[0].GetChannel())
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_UpdatePartitionStats() {
+	ctx := context.Background()
+	// prepare
+	// watch dmchannel and load some segments
+	suite.TestWatchDmChannelsInt64()
+
+	// write partitionStats file
+	partitionID := suite.partitionIDs[0]
+	newVersion := int64(100)
+	idPath := metautil.JoinIDPath(suite.collectionID, partitionID)
+	idPath = path.Join(idPath, suite.vchannel)
+	statsFilePath := path.Join(suite.node.chunkManager.RootPath(), common.PartitionStatsPath, idPath, strconv.FormatInt(newVersion, 10))
+	segStats := make(map[typeutil.UniqueID]storage.SegmentStats)
+	partitionStats := &storage.PartitionStatsSnapshot{
+		SegmentStats: segStats,
+	}
+	statsData, err := storage.SerializePartitionStatsSnapshot(partitionStats)
+	suite.NoError(err)
+	suite.node.chunkManager.Write(context.Background(), statsFilePath, statsData)
+	defer suite.node.chunkManager.Remove(context.Background(), statsFilePath)
+
+	// sync part stats
+	req := &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      suite.vchannel,
+	}
+
+	partVersionsMap := make(map[int64]int64)
+	partVersionsMap[partitionID] = newVersion
+	updatePartStatsAction := &querypb.SyncAction{
+		Type:                   querypb.SyncType_UpdatePartitionStats,
+		PartitionStatsVersions: partVersionsMap,
+	}
+	req.Actions = []*querypb.SyncAction{updatePartStatsAction}
+	status, err := suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+
+	getReq := &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID: rand.Int63(),
+		},
+	}
+	distribution, err := suite.node.GetDataDistribution(ctx, getReq)
+	suite.NoError(err)
+	suite.Equal(1, len(distribution.LeaderViews))
+	leaderView := distribution.LeaderViews[0]
+	latestPartStats := leaderView.GetPartitionStatsVersions()
+	suite.Equal(latestPartStats[partitionID], newVersion)
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_ReleaseResultCheck() {
+	ctx := context.Background()
+	// prepare
+	// watch dmchannel and load some segments
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	dlg, ok := suite.node.delegators.Get(suite.vchannel)
+	suite.True(ok)
+	// snapshot generation is async, wait for it to reflect loaded segments
+	var sealedSegments []delegator.SnapshotItem
+	suite.Require().Eventually(func() bool {
+		sealedSegments, _ = dlg.GetSegmentInfo(false)
+		return len(sealedSegments) > 0 && len(sealedSegments[0].Segments) == 3
+	}, time.Second, 10*time.Millisecond)
+
+	// data
+	req := &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      suite.vchannel,
+	}
+
+	releaseAction := &querypb.SyncAction{
+		Type:      querypb.SyncType_Remove,
+		SegmentID: sealedSegments[0].Segments[0].SegmentID,
+		NodeID:    100,
+	}
+
+	// expect one segments in distribution
+	req.Actions = []*querypb.SyncAction{releaseAction}
+	status, err := suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+	sealedSegments, _ = dlg.GetSegmentInfo(false)
+	suite.Len(sealedSegments[0].Segments, 2)
+
+	releaseAction = &querypb.SyncAction{
+		Type:      querypb.SyncType_Remove,
+		SegmentID: sealedSegments[0].Segments[0].SegmentID,
+		NodeID:    sealedSegments[0].Segments[0].NodeID,
+	}
+
+	// expect one segments in distribution
+	req.Actions = []*querypb.SyncAction{releaseAction}
+	status, err = suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+	sealedSegments, _ = dlg.GetSegmentInfo(false)
+	suite.Len(sealedSegments[0].Segments, 1)
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_Failed() {
+	ctx := context.Background()
+	// prepare
+	// watch dmchannel and load some segments
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	// data
+	req := &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      suite.vchannel,
+	}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err := suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestSyncDistribution_RejectV25Message() {
+	ctx := context.Background()
+	// prepare
+	// watch dmchannel and load some segments
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	// data
+	req := &querypb.SyncDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		Channel:      suite.vchannel,
+		LoadMeta: &querypb.LoadMetaInfo{
+			PartitionIDs: suite.partitionIDs,
+		},
+	}
+
+	// Create a v2.5 style message: SealedInTarget is not empty but SealedSegmentRowCount is empty
+	v25StyleAction := &querypb.SyncAction{
+		Type:           querypb.SyncType_UpdateVersion,
+		SealedInTarget: []int64{3, 4, 5}, // Non-empty
+		// Note: SealedSegmentRowCount is not set (empty), simulating v2.5 format
+		GrowingInTarget: []int64{6},
+		DroppedInTarget: []int64{1, 2},
+		TargetVersion:   time.Now().UnixMilli(),
+		Checkpoint:      &msgpb.MsgPosition{Timestamp: 1000},
+		DeleteCP:        &msgpb.MsgPosition{Timestamp: 500},
+	}
+
+	req.Actions = []*querypb.SyncAction{v25StyleAction}
+
+	// This should succeed (no error returned), but the v2.5 message should be rejected
+	status, err := suite.node.SyncDistribution(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	// Verify that the v2.5 message was rejected by checking that no version sync happened
+	// The delegator should not have processed this message
+	// We can verify this by checking if the state was not updated (delegator should remain serviceable: false)
+	shardDelegator, ok := suite.node.delegators.Get(suite.vchannel)
+	suite.True(ok)
+
+	// After rejection, the delegator's version should still be at initial state
+	// (not updated by the v2.5 message)
+	// We verify this indirectly by checking that no segments were marked as excluded
+	suite.Equal(int64(0), shardDelegator.Version())
+}
+
+func (suite *ServiceSuite) TestDelete_Int64() {
+	ctx := context.Background()
+	// prepare
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	// data
+	req := &querypb.DeleteRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionId: suite.collectionID,
+		PartitionId:  suite.partitionIDs[0],
+		SegmentId:    suite.validSegmentIDs[0],
+		VchannelName: suite.vchannel,
+		Timestamps:   []uint64{0},
+		Scope:        querypb.DataScope_Historical,
+	}
+
+	// type int
+	req.PrimaryKeys = &schemapb.IDs{
+		IdField: &schemapb.IDs_IntId{
+			IntId: &schemapb.LongArray{
+				Data: []int64{111},
+			},
+		},
+	}
+	status, err := suite.node.Delete(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+}
+
+func (suite *ServiceSuite) TestDelete_Int64_UseLoad() {
+	ctx := context.Background()
+	// prepare
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	// data
+	req := &querypb.DeleteRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionId: suite.collectionID,
+		PartitionId:  suite.partitionIDs[0],
+		SegmentId:    suite.validSegmentIDs[0],
+		VchannelName: suite.vchannel,
+		Timestamps:   []uint64{0},
+		Scope:        querypb.DataScope_Historical,
+		UseLoad:      true,
+	}
+
+	// type int
+	req.PrimaryKeys = &schemapb.IDs{
+		IdField: &schemapb.IDs_IntId{
+			IntId: &schemapb.LongArray{
+				Data: []int64{111},
+			},
+		},
+	}
+	status, err := suite.node.Delete(ctx, req)
+	suite.NoError(merr.CheckRPCCall(status, err))
+}
+
+func (suite *ServiceSuite) TestDelete_VarChar() {
+	ctx := context.Background()
+	// prepare
+	suite.TestWatchDmChannelsVarchar()
+	suite.TestLoadSegments_VarChar()
+	// data
+	req := &querypb.DeleteRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionId: suite.collectionID,
+		PartitionId:  suite.partitionIDs[0],
+		SegmentId:    suite.validSegmentIDs[0],
+		VchannelName: suite.vchannel,
+		Timestamps:   []uint64{2000},
+	}
+
+	// type int
+	req.PrimaryKeys = &schemapb.IDs{
+		IdField: &schemapb.IDs_StrId{
+			StrId: &schemapb.StringArray{
+				Data: []string{"111"},
+			},
+		},
+	}
+	status, err := suite.node.Delete(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+}
+
+func (suite *ServiceSuite) TestDelete_Failed() {
+	ctx := context.Background()
+	// prepare
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+	// data
+	req := &querypb.DeleteRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionId: suite.collectionID,
+		PartitionId:  suite.partitionIDs[0],
+		SegmentId:    suite.validSegmentIDs[0],
+		VchannelName: suite.vchannel,
+		Timestamps:   []uint64{0},
+	}
+
+	// type int
+	req.PrimaryKeys = &schemapb.IDs{
+		IdField: &schemapb.IDs_IntId{
+			IntId: &schemapb.LongArray{
+				Data: []int64{111},
+			},
+		},
+	}
+
+	// segment not found
+	req.Scope = querypb.DataScope_Streaming
+	status, err := suite.node.Delete(ctx, req)
+	suite.NoError(err)
+	suite.False(merr.Ok(status))
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err = suite.node.Delete(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+}
+
+func (suite *ServiceSuite) TestLoadPartition() {
+	ctx := context.Background()
+	req := &querypb.LoadPartitionsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+	}
+
+	// node not healthy
+	suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+	status, err := suite.node.LoadPartitions(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_NotReadyServe, status.GetErrorCode())
+	suite.node.UpdateStateCode(commonpb.StateCode_Healthy)
+
+	// collection existed
+	status, err = suite.node.LoadPartitions(ctx, req)
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
+}
+
+func (suite *ServiceSuite) TestUpdateSchema() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	schema.Version = 100
+	req := &querypb.UpdateSchemaRequest{
+		CollectionID:    suite.collectionID,
+		Schema:          schema,
+		SchemaBarrierTs: uint64(100),
+	}
+	manager := suite.node.manager.Collection
+	// reset manager to align default teardown logic
+	defer func() {
+		suite.node.manager.Collection = manager
+	}()
+	mockManager := segments.NewMockCollectionManager(suite.T())
+	suite.node.manager.Collection = mockManager
+
+	suite.Run("normal", func() {
+		mockManager.EXPECT().UpdateSchema(suite.collectionID, schema, uint64(100)).Return(nil).Once()
+
+		status, err := suite.node.UpdateSchema(ctx, req)
+		suite.NoError(merr.CheckRPCCall(status, err))
+	})
+
+	suite.Run("passes_barrier_to_collection_manager", func() {
+		schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+		schema.Version = 2
+		req := &querypb.UpdateSchemaRequest{
+			CollectionID:    suite.collectionID,
+			Schema:          schema,
+			SchemaBarrierTs: uint64(100),
+		}
+		mockManager.EXPECT().UpdateSchema(suite.collectionID, schema, uint64(100)).Return(nil).Once()
+
+		status, err := suite.node.UpdateSchema(ctx, req)
+		suite.NoError(merr.CheckRPCCall(status, err))
+	})
+
+	suite.Run("manager_returns_error", func() {
+		mockManager.EXPECT().UpdateSchema(suite.collectionID, schema, uint64(100)).Return(merr.WrapErrServiceInternal("mocked")).Once()
+
+		status, err := suite.node.UpdateSchema(ctx, req)
+		suite.Error(merr.CheckRPCCall(status, err))
+	})
+
+	suite.Run("abonormal_node", func() {
+		suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+		defer suite.node.UpdateStateCode(commonpb.StateCode_Healthy)
+		status, err := suite.node.UpdateSchema(ctx, req)
+		suite.Error(merr.CheckRPCCall(status, err))
+	})
+}
+
+func (suite *ServiceSuite) TestRunAnalyzer() {
+	ctx := context.Background()
+	suite.Run("delegator not exist", func() {
+		resp, err := suite.node.RunAnalyzer(ctx, &querypb.RunAnalyzerRequest{
+			Channel:     suite.vchannel,
+			FieldId:     100,
+			Placeholder: [][]byte{[]byte("test doc")},
+		})
+
+		suite.Require().NoError(err)
+		suite.Require().Error(merr.Error(resp.GetStatus()))
+	})
+
+	suite.Run("normal run", func() {
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+
+		delegator.EXPECT().RunAnalyzer(mock.Anything, mock.Anything).Return(
+			[]*milvuspb.AnalyzerResult{}, nil)
+
+		_, err := suite.node.RunAnalyzer(ctx, &querypb.RunAnalyzerRequest{
+			Channel:     suite.vchannel,
+			FieldId:     100,
+			Placeholder: [][]byte{[]byte("test doc")},
+		})
+
+		suite.Require().NoError(err)
+	})
+
+	suite.Run("run analyzer failed", func() {
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+
+		delegator.EXPECT().RunAnalyzer(mock.Anything, mock.Anything).Return(
+			nil, fmt.Errorf("mock error"))
+
+		resp, err := suite.node.RunAnalyzer(ctx, &querypb.RunAnalyzerRequest{
+			Channel:     suite.vchannel,
+			FieldId:     100,
+			Placeholder: [][]byte{[]byte("test doc")},
+		})
+
+		suite.Require().NoError(err)
+		suite.Require().Error(merr.Error(resp.GetStatus()))
+	})
+}
+
+func (suite *ServiceSuite) TestValidateAnalyzer() {
+	ctx := context.Background()
+
+	suite.Run("normal validate", func() {
+		req := &querypb.ValidateAnalyzerRequest{
+			AnalyzerInfos: []*querypb.AnalyzerInfo{
+				{
+					Field:  "test_field",
+					Name:   "test_analyzer",
+					Params: `{}`,
+				},
+			},
+		}
+
+		resp, err := suite.node.ValidateAnalyzer(ctx, req)
+		suite.Require().NoError(err)
+		suite.Require().Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	suite.Run("invalid analyzer params", func() {
+		req := &querypb.ValidateAnalyzerRequest{
+			AnalyzerInfos: []*querypb.AnalyzerInfo{
+				{
+					Field:  "test_field",
+					Name:   "test_analyzer",
+					Params: `{"invalid": "params"}`,
+				},
+			},
+		}
+
+		resp, err := suite.node.ValidateAnalyzer(ctx, req)
+		suite.Require().NoError(err)
+		suite.Require().NotEqual(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	suite.Run("abnormal node", func() {
+		suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+		defer suite.node.UpdateStateCode(commonpb.StateCode_Healthy)
+
+		req := &querypb.ValidateAnalyzerRequest{
+			AnalyzerInfos: []*querypb.AnalyzerInfo{
+				{
+					Field:  "test_field",
+					Params: `{}`,
+				},
+			},
+		}
+
+		resp, err := suite.node.ValidateAnalyzer(ctx, req)
+		suite.Require().NoError(err)
+		suite.Require().NotEqual(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+}
+
+func (suite *ServiceSuite) TestGetHighlight() {
+	ctx := context.Background()
+
+	suite.Run("node not healthy", func() {
+		suite.node.UpdateStateCode(commonpb.StateCode_Abnormal)
+		defer suite.node.UpdateStateCode(commonpb.StateCode_Healthy)
+
+		resp, err := suite.node.GetHighlight(ctx, &querypb.GetHighlightRequest{
+			Channel: suite.vchannel,
+			Topks:   []int64{10},
+		})
+
+		suite.NoError(err)
+		suite.Error(merr.Error(resp.GetStatus()))
+	})
+
+	suite.Run("normal case", func() {
+		delegator := &delegator.MockShardDelegator{}
+		suite.node.delegators.Insert(suite.vchannel, delegator)
+		defer suite.node.delegators.GetAndRemove(suite.vchannel)
+		delegator.EXPECT().GetHighlight(mock.Anything, mock.Anything).Return(
+			[]*querypb.HighlightResult{}, nil)
+		resp, err := suite.node.GetHighlight(ctx, &querypb.GetHighlightRequest{
+			Channel: suite.vchannel,
+			Topks:   []int64{1, 1},
+			Tasks: []*querypb.HighlightTask{
+				{
+					FieldName:     "text_field",
+					FieldId:       100,
+					Texts:         []string{"target text", "target text2", "text", "text2"},
+					AnalyzerNames: []string{"standard", "standard", "standard", "standard"},
+					SearchTextNum: 2,
+					CorpusTextNum: 2,
+				},
+			},
+		})
+
+		suite.NoError(err)
+		suite.NoError(merr.Error(resp.GetStatus()))
+		suite.NotNil(resp.Results)
+	})
+}
+
+func TestQueryNodeService(t *testing.T) {
+	wal := mock_streaming.NewMockWALAccesser(t)
+	local := mock_streaming.NewMockLocal(t)
+	local.EXPECT().GetLatestMVCCTimestampIfLocal(mock.Anything, mock.Anything).Return(0, nil).Maybe()
+	local.EXPECT().PrepareReleaseManualFlushIfLocal(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(false, nil).Maybe()
+	local.EXPECT().GetMetricsIfLocal(mock.Anything).Return(&types.StreamingNodeMetrics{}, nil).Maybe()
+	wal.EXPECT().Local().Return(local).Maybe()
+	scanner := mock_streaming.NewMockScanner(t)
+	scanner.EXPECT().Done().Return(make(chan struct{})).Maybe()
+	scanner.EXPECT().Error().Return(nil).Maybe()
+	scanner.EXPECT().Close().Return().Maybe()
+	wal.EXPECT().Read(mock.Anything, mock.Anything).Return(scanner).Maybe()
+	paramtable.SetRole(typeutil.StandaloneRole)
+	paramtable.Get().MQCfg.Type.SwapTempValue(message.WALNameRocksmq.String())
+	util.InitAndSelectWALName()
+
+	streaming.SetWALForTest(wal)
+	defer streaming.RecoverWALForTest()
+
+	suite.Run(t, new(ServiceSuite))
+}
