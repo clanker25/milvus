@@ -1,0 +1,90 @@
+package metrics
+
+import (
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+var (
+	infoMutex sync.Mutex
+	mqType    string
+	metaType  string
+
+	BuildInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Name:      "build_info",
+			Help:      "Build information of milvus",
+		},
+		[]string{
+			"version",
+			"built",
+			"git_commit",
+		},
+	)
+
+	RuntimeInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Name:      "runtime_info",
+			Help:      "Runtime information of milvus",
+		},
+		[]string{
+			"mq",
+			"meta",
+		},
+	)
+
+	ThreadNum = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Name:      "thread_num",
+			Help:      "the actual thread number of milvus process",
+		},
+	)
+
+	ThreadPoolCPUSeconds = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Name:      "thread_pool_cpu_seconds_total",
+			Help:      "Sampled CPU seconds by OS thread pool and mode (user includes niced threads); excludes the initial baseline and may miss exiting threads.",
+		},
+		[]string{"thread_pool", "cpu_mode"},
+	)
+
+	ThreadCPUActiveNumByPool = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Name:      "thread_cpu_active_num_by_pool",
+			Help:      "the approximate active thread number of milvus process by named OS thread pool CPU time delta",
+		},
+		[]string{
+			"thread_pool",
+		},
+	)
+)
+
+// RegisterMQType registers the type of mq
+func RegisterMQType(mq string) {
+	infoMutex.Lock()
+	defer infoMutex.Unlock()
+	mqType = mq
+	updateRuntimeInfo()
+}
+
+// RegisterMetaType registers the type of meta
+func RegisterMetaType(meta string) {
+	infoMutex.Lock()
+	defer infoMutex.Unlock()
+	metaType = meta
+	updateRuntimeInfo()
+}
+
+// updateRuntimeInfo update the runtime info of milvus if every label is ready.
+func updateRuntimeInfo() {
+	if mqType == "" || metaType == "" {
+		return
+	}
+	RuntimeInfo.WithLabelValues(mqType, metaType).Set(1)
+}

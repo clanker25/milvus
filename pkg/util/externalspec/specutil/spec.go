@@ -1,0 +1,289 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package specutil owns the shared external_spec parser used by API validation
+// and lower storage helpers without importing the higher-level externalspec
+// package.
+package specutil
+
+import (
+	"encoding/json"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+)
+
+// File formats supported by external collections. Mirror of LOON_FORMAT_*
+// in the C++ FFI layer -- keep the two in sync.
+const (
+	FormatParquet      = "parquet"
+	FormatLanceTable   = "lance-table"
+	FormatVortex       = "vortex"
+	FormatIcebergTable = "iceberg-table"
+	FormatPaimonTable  = "paimon-table"
+	FormatMilvusTable  = "milvus-table"
+)
+
+// ExtfsKey* are the canonical spec.extfs key names. Use these instead of
+// string literals; keep in sync with kAllowedExtfsSpecKeys / kExtfsFields in
+// internal/core/src/storage/loon_ffi/util.cpp.
+const (
+	ExtfsKeyAccessKeyID             = "access_key_id"
+	ExtfsKeyAccessKeyValue          = "access_key_value"
+	ExtfsKeyRoleARN                 = "role_arn"
+	ExtfsKeySessionName             = "session_name"
+	ExtfsKeyExternalID              = "external_id"
+	ExtfsKeyUseIAM                  = "use_iam"
+	ExtfsKeyAnonymous               = "anonymous"
+	ExtfsKeyGCPTargetServiceAccount = "gcp_target_service_account"
+	ExtfsKeyRegion                  = "region"
+	ExtfsKeyCloudProvider           = "cloud_provider"
+	ExtfsKeyEndpointURL             = "endpoint_url"
+	ExtfsKeyBucketName              = "bucket_name"
+	ExtfsKeyIAMEndpoint             = "iam_endpoint"
+	ExtfsKeyStorageType             = "storage_type"
+	ExtfsKeySSLCACert               = "ssl_ca_cert"
+	ExtfsKeyUseSSL                  = "use_ssl"
+	ExtfsKeyUseVirtualHost          = "use_virtual_host"
+	ExtfsKeyLoadFrequency           = "load_frequency"
+	// #nosec G101 -- configuration key name, not a credential.
+	ExtfsKeyCredentialEndpoint = "credential_endpoint"
+	ExtfsKeyAzureClientID      = "azure_client_id"
+	ExtfsKeyAzureTenantID      = "azure_tenant_id"
+	// #nosec G101 -- configuration key name, not a credential.
+	ExtfsKeyAzureCredentialEndpoint = "azure_credential_endpoint"
+)
+
+// ExternalSpec represents the parsed external collection specification.
+type ExternalSpec struct {
+	Format     string            `json:"format"`          // one of Format* constants
+	Columns    []string          `json:"columns"`         // optional: specific columns to load
+	Extfs      map[string]string `json:"extfs,omitempty"` // optional: extfs config overrides
+	SnapshotID *int64            `json:"snapshot_id,omitempty"`
+	ScanMode   string            `json:"scan_mode,omitempty"` // Paimon: auto, direct-file, or data-split
+}
+
+// UnmarshalJSON accepts snapshot_id as either a JSON number or a decimal
+// string so old clients and JSON-preserving paths parse to the same structure.
+func (s *ExternalSpec) UnmarshalJSON(data []byte) error {
+	type externalSpec ExternalSpec
+	var raw struct {
+		externalSpec
+		SnapshotID json.RawMessage `json:"snapshot_id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*s = ExternalSpec(raw.externalSpec)
+	if parsed, err := parseOptionalInt64(raw.SnapshotID); err != nil {
+		return err
+	} else {
+		s.SnapshotID = parsed
+	}
+	return nil
+}
+
+// parseOptionalInt64 parses an optional integer that may be encoded as a JSON
+// number, string, or null.
+func parseOptionalInt64(raw json.RawMessage) (*int64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return &n, nil
+	}
+	var str string
+	if err := json.Unmarshal(raw, &str); err != nil {
+		return nil, err
+	}
+	parsed, err := strconv.ParseInt(str, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+// MarshalJSON emits snapshot_id as a string to preserve int64 precision across
+// JavaScript JSON clients.
+func (s ExternalSpec) MarshalJSON() ([]byte, error) {
+	type externalSpec ExternalSpec
+	var raw struct {
+		externalSpec
+		SnapshotID *string `json:"snapshot_id,omitempty"`
+	}
+	raw.externalSpec = externalSpec(s)
+	if s.SnapshotID != nil {
+		str := strconv.FormatInt(*s.SnapshotID, 10)
+		raw.SnapshotID = &str
+	}
+	return json.Marshal(raw)
+}
+
+// supportedFormats lists the file formats supported for external collections.
+var supportedFormats = map[string]bool{
+	FormatParquet:      true,
+	FormatLanceTable:   true,
+	FormatVortex:       true,
+	FormatIcebergTable: true,
+	FormatPaimonTable:  true,
+	FormatMilvusTable:  true,
+}
+
+// allowedExtfsKeys gates keys permitted in ExternalSpec.extfs. Persisted in
+// etcd as part of CollectionSchema. Keep in sync with C++ kAllowedExtfsSpecKeys.
+var allowedExtfsKeys = map[string]bool{
+	ExtfsKeyUseIAM:                  true,
+	ExtfsKeyUseSSL:                  true,
+	ExtfsKeyUseVirtualHost:          true,
+	ExtfsKeyRegion:                  true,
+	ExtfsKeyCloudProvider:           true,
+	ExtfsKeyEndpointURL:             true,
+	ExtfsKeyIAMEndpoint:             true,
+	ExtfsKeyStorageType:             true,
+	ExtfsKeySSLCACert:               true,
+	ExtfsKeyAccessKeyID:             true,
+	ExtfsKeyAccessKeyValue:          true,
+	ExtfsKeyRoleARN:                 true,
+	ExtfsKeySessionName:             true,
+	ExtfsKeyExternalID:              true,
+	ExtfsKeyLoadFrequency:           true,
+	ExtfsKeyBucketName:              true,
+	ExtfsKeyGCPTargetServiceAccount: true,
+	ExtfsKeyAnonymous:               true,
+	ExtfsKeyCredentialEndpoint:      true,
+	ExtfsKeyAzureClientID:           true,
+	ExtfsKeyAzureTenantID:           true,
+	ExtfsKeyAzureCredentialEndpoint: true,
+}
+
+var booleanExtfsKeys = map[string]bool{
+	ExtfsKeyUseIAM:         true,
+	ExtfsKeyUseSSL:         true,
+	ExtfsKeyUseVirtualHost: true,
+	ExtfsKeyAnonymous:      true,
+}
+
+// ParseExternalSpec parses and validates the JSON shape of an external spec.
+func ParseExternalSpec(specStr string) (*ExternalSpec, error) {
+	if specStr == "" {
+		return &ExternalSpec{Format: FormatParquet}, nil
+	}
+
+	var spec ExternalSpec
+	if err := json.Unmarshal([]byte(specStr), &spec); err != nil {
+		return nil, merr.WrapErrParameterInvalidErr(err, "invalid external spec JSON")
+	}
+
+	if spec.Format == "" {
+		spec.Format = FormatParquet
+	}
+
+	if !supportedFormats[spec.Format] {
+		return nil, merr.WrapErrParameterInvalidMsg("unsupported format %q, supported formats: %s",
+			spec.Format, strings.Join(sortedKeys(supportedFormats), ", "))
+	}
+
+	if spec.Format == FormatPaimonTable {
+		if spec.ScanMode == "" {
+			spec.ScanMode = "auto"
+		}
+		switch spec.ScanMode {
+		case "auto", "direct-file", "data-split":
+		default:
+			return nil, merr.WrapErrParameterInvalidMsg(
+				"unsupported Paimon scan_mode %q; allowed values: auto, direct-file, data-split", spec.ScanMode)
+		}
+	} else if spec.ScanMode != "" {
+		return nil, merr.WrapErrParameterInvalidMsg("scan_mode is only supported for format %q", FormatPaimonTable)
+	}
+
+	for key, val := range spec.Extfs {
+		if !allowedExtfsKeys[key] {
+			return nil, merr.WrapErrParameterInvalidMsg("extfs key %q is not allowed; allowed keys: %s",
+				key, strings.Join(sortedKeys(allowedExtfsKeys), ", "))
+		}
+		if booleanExtfsKeys[key] && val != "true" && val != "false" {
+			return nil, merr.WrapErrParameterInvalidMsg("extfs key %q must be \"true\" or \"false\", got %q", key, val)
+		}
+	}
+
+	return &spec, nil
+}
+
+// NormalizeExternalSpec decodes a spec and canonicalizes known top-level
+// keys for case-sensitive native readers. Call it at native boundaries as well
+// as for new inputs: persisted schemas may contain legacy case variants.
+//
+// Duplicate known keys use the result of Go's existing typed decoder, in input
+// order (including map merging and null handling). Unknown values stay as raw
+// JSON, preserving nested fields and numeric precision. Missing optional keys
+// remain absent, so a missing scan_mode does not override reader defaults.
+// API policy validation remains in ParseExternalSpec; native callers retain
+// their existing handling of unknown formats and filesystem options.
+func NormalizeExternalSpec(specStr string) (string, error) {
+	if specStr == "" {
+		return "", nil
+	}
+	var spec ExternalSpec
+	if err := json.Unmarshal([]byte(specStr), &spec); err != nil {
+		return "", merr.WrapErrParameterInvalidErr(err, "invalid external spec JSON")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(specStr), &fields); err != nil {
+		return "", merr.WrapErrParameterInvalidErr(err, "invalid external spec JSON")
+	}
+	// A top-level null has historically meant the default spec.
+	if fields == nil {
+		return specStr, nil
+	}
+	var snapshotID *string
+	if spec.SnapshotID != nil {
+		value := strconv.FormatInt(*spec.SnapshotID, 10)
+		snapshotID = &value
+	}
+	known := map[string]any{
+		"format": spec.Format, "columns": spec.Columns, "extfs": spec.Extfs,
+		"snapshot_id": snapshotID, "scan_mode": spec.ScanMode,
+	}
+	normalized := make(map[string]any, len(fields))
+	for key, raw := range fields {
+		canonical, value := key, any(raw)
+		for name, parsed := range known {
+			if strings.EqualFold(key, name) {
+				canonical, value = name, parsed
+				break
+			}
+		}
+		normalized[canonical] = value
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return "", merr.WrapErrServiceInternalErr(err, "marshal normalized external spec")
+	}
+	return string(encoded), nil
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
