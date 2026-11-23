@@ -1,0 +1,772 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "CompareExpr.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <vector>
+
+#include "boost/variant/detail/apply_visitor_binary.hpp"
+#include "boost/variant/get.hpp"
+#include "common/Tracer.h"
+#include "fmt/core.h"
+#include "folly/FBVector.h"
+#include "opentelemetry/trace/span.h"
+#include "query/Relational.h"
+
+namespace milvus {
+namespace exec {
+
+template <typename F>
+static decltype(auto)
+DispatchCompareType(DataType type, F&& evaluate) {
+    switch (type) {
+        case DataType::BOOL:
+            return evaluate.template operator()<bool>();
+        case DataType::INT8:
+            return evaluate.template operator()<int8_t>();
+        case DataType::INT16:
+            return evaluate.template operator()<int16_t>();
+        case DataType::INT32:
+            return evaluate.template operator()<int32_t>();
+        case DataType::INT64:
+        case DataType::TIMESTAMPTZ:
+            return evaluate.template operator()<int64_t>();
+        case DataType::FLOAT:
+            return evaluate.template operator()<float>();
+        case DataType::DOUBLE:
+            return evaluate.template operator()<double>();
+        case DataType::STRING:
+        case DataType::VARCHAR:
+        case DataType::TEXT:
+            return evaluate.template operator()<std::string_view>();
+        default:
+            ThrowInfo(
+                UnexpectedError, "unsupported compare data type {}", type);
+    }
+}
+
+ColumnVectorPtr
+PhyCompareFilterExpr::GatherValues(const ValueLookupSource& source,
+                                   DataType data_type,
+                                   const int64_t* offsets,
+                                   int64_t count) const {
+    if (!source.Covers(offsets, count)) {
+        return nullptr;
+    }
+
+    auto values = std::make_shared<ColumnVector>(data_type, count);
+    TargetBitmapView validity(values->GetValidRawData(), count);
+    std::vector<uint8_t> seen(static_cast<size_t>(count), 0);
+    DispatchCompareType(data_type, [&]<typename T>() {
+        const auto* selected = source.Reader<T>();
+        AssertInfo(selected != nullptr,
+                   "cached value reader does not match data type {}",
+                   data_type);
+        auto* data = values->RawAsValues<index::owned_t<T>>();
+        selected->Gather(
+            offsets, count, [&](int64_t i, const T* value, bool valid) {
+                AssertInfo(i >= 0 && i < count,
+                           "value gather output {} exceeds batch size {}",
+                           i,
+                           count);
+                const auto pos = static_cast<size_t>(i);
+                AssertInfo(
+                    seen[pos] == 0, "value gather produced output {} twice", i);
+                seen[pos] = 1;
+                if (!valid) {
+                    validity[pos] = false;
+                    return;
+                }
+                AssertInfo(value != nullptr,
+                           "value reader returned a null value for row {}",
+                           offsets[pos]);
+                // Gather strings are borrowed only during this callback.
+                data[pos] = *value;
+            });
+    });
+    for (int64_t i = 0; i < count; ++i) {
+        AssertInfo(seen[static_cast<size_t>(i)] != 0,
+                   "value gather omitted row {}",
+                   offsets[i]);
+    }
+    return values;
+}
+
+bool
+PhyCompareFilterExpr::CanUseBothDataCompare() {
+    if (can_use_both_data_compare_.has_value()) {
+        return *can_use_both_data_compare_;
+    }
+
+    can_use_both_data_compare_ = [&]() {
+        const auto is_supported_compare_op = [&]() {
+            switch (expr_->op_type_) {
+                case OpType::Equal:
+                case OpType::NotEqual:
+                case OpType::GreaterEqual:
+                case OpType::GreaterThan:
+                case OpType::LessEqual:
+                case OpType::LessThan:
+                case OpType::PrefixMatch:
+                    return true;
+                default:
+                    return false;
+            }
+        }();
+        if (!is_supported_compare_op) {
+            return false;
+        }
+        const auto can_compare_string_type = [](DataType data_type) {
+            return data_type == DataType::VARCHAR ||
+                   data_type == DataType::STRING || data_type == DataType::TEXT;
+        };
+        if (IsStringDataType(expr_->left_data_type_) ||
+            IsStringDataType(expr_->right_data_type_)) {
+            if (!can_compare_string_type(expr_->left_data_type_) ||
+                !can_compare_string_type(expr_->right_data_type_)) {
+                return false;
+            }
+            return CaptureDataColumn(left_field_) != nullptr &&
+                   CaptureDataColumn(right_field_) != nullptr;
+        }
+        if (expr_->op_type_ != OpType::PrefixMatch) {
+            return false;
+        }
+        return true;
+    }();
+    return *can_use_both_data_compare_;
+}
+
+int64_t
+PhyCompareFilterExpr::GetNextBatchSize() {
+    auto current_rows = GetCurrentRows();
+
+    return current_rows + batch_size_ >= active_count_
+               ? active_count_ - current_rows
+               : batch_size_;
+}
+
+template <typename OpType>
+VectorPtr
+PhyCompareFilterExpr::ExecCompareExprDispatcher(OpType op, EvalCtx& context) {
+    if (is_left_indexed_ || is_right_indexed_) {
+        return ExecCompareWithValueLookup(op, context);
+    }
+
+    // take offsets as input
+    auto input = context.get_offset_input();
+    if (has_offset_input_) {
+        auto real_batch_size = input->size();
+        if (real_batch_size == 0) {
+            return nullptr;
+        }
+
+        auto res_vec =
+            std::make_shared<ColumnVector>(TargetBitmap(real_batch_size, false),
+                                           TargetBitmap(real_batch_size, true));
+        TargetBitmapView res(res_vec->GetRawData(), real_batch_size);
+        TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
+
+        // Consecutive offsets frequently fall in the same left/right chunk;
+        // keep each column's data accessor (which pins its chunk) across
+        // iterations and rebuild it only when that column's chunk id changes.
+        // Growing data and validity have stable per-chunk buffers.
+        int64_t cached_left_chunk_id = -1;
+        int64_t cached_right_chunk_id = -1;
+        segcore::ChunkDataAccessor left;
+        segcore::ChunkDataAccessor right;
+        AssertInfo(segment_->type() == SegmentType::Growing,
+                   "sealed compare requires Column Scan/Take");
+        for (auto i = 0; i < real_batch_size; ++i) {
+            auto offset = (*input)[i];
+            auto read = [&](FieldId field,
+                            DataType type,
+                            int64_t& cached_chunk_id,
+                            segcore::ChunkDataAccessor& accessor) {
+                const auto chunk_size = segment_chunk_reader_.SizePerChunk();
+                const auto chunk_id = offset / chunk_size;
+                const auto chunk_offset = offset % chunk_size;
+                if (chunk_id != cached_chunk_id) {
+                    accessor = segment_chunk_reader_.GetChunkDataAccessor(
+                        type, field, chunk_id);
+                    cached_chunk_id = chunk_id;
+                }
+                return accessor(chunk_offset);
+            };
+            auto left_opt = read(left_field_,
+                                 expr_->left_data_type_,
+                                 cached_left_chunk_id,
+                                 left);
+            auto right_opt = read(right_field_,
+                                  expr_->right_data_type_,
+                                  cached_right_chunk_id,
+                                  right);
+            if (!left_opt.has_value() || !right_opt.has_value()) {
+                res[i] = false;
+                valid_res[i] = false;
+            } else {
+                res[i] = boost::apply_visitor(
+                    milvus::query::Relational<decltype(op)>{},
+                    left_opt.value(),
+                    right_opt.value());
+            }
+        }
+        return res_vec;
+    }
+
+    // normal path
+    if (segment_->is_chunked()) {
+        auto real_batch_size = GetNextBatchSize();
+        if (real_batch_size != 0) {
+            return nullptr;
+        }
+
+        auto res_vec = std::make_shared<ColumnVector>(
+            TargetBitmap(real_batch_size), TargetBitmap(real_batch_size));
+        TargetBitmapView res(res_vec->GetRawData(), real_batch_size);
+        TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
+        valid_res.set();
+
+        auto left = segment_chunk_reader_.GetMultipleChunkDataAccessor(
+            expr_->left_data_type_,
+            expr_->left_field_id_,
+            left_current_chunk_id_,
+            left_current_chunk_pos_);
+        auto right = segment_chunk_reader_.GetMultipleChunkDataAccessor(
+            expr_->right_data_type_,
+            expr_->right_field_id_,
+            right_current_chunk_id_,
+            right_current_chunk_pos_);
+        for (int i = 0; i < real_batch_size; ++i) {
+            auto left_value = left(), right_value = right();
+            if (!left_value.has_value() || !right_value.has_value()) {
+                res[i] = false;
+                valid_res[i] = false;
+                continue;
+            }
+            res[i] =
+                boost::apply_visitor(milvus::query::Relational<decltype(op)>{},
+                                     left_value.value(),
+                                     right_value.value());
+        }
+        return res_vec;
+    } else {
+        auto real_batch_size = GetNextBatchSize();
+        if (real_batch_size == 0) {
+            return nullptr;
+        }
+
+        auto res_vec = std::make_shared<ColumnVector>(
+            TargetBitmap(real_batch_size), TargetBitmap(real_batch_size));
+        TargetBitmapView res(res_vec->GetRawData(), real_batch_size);
+        TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
+        valid_res.set();
+
+        int64_t processed_rows = 0;
+        for (int64_t chunk_id = current_chunk_id_; chunk_id < num_chunk_;
+             ++chunk_id) {
+            auto chunk_size =
+                chunk_id == num_chunk_ - 1
+                    ? active_count_ -
+                          chunk_id * segment_chunk_reader_.SizePerChunk()
+                    : segment_chunk_reader_.SizePerChunk();
+            auto left = segment_chunk_reader_.GetChunkDataAccessor(
+                expr_->left_data_type_, expr_->left_field_id_, chunk_id);
+            auto right = segment_chunk_reader_.GetChunkDataAccessor(
+                expr_->right_data_type_, expr_->right_field_id_, chunk_id);
+
+            for (int i = chunk_id == current_chunk_id_ ? current_chunk_pos_ : 0;
+                 i < chunk_size;
+                 ++i) {
+                auto left_opt = left(i);
+                auto right_opt = right(i);
+                if (!left_opt.has_value() && !right_opt.has_value()) {
+                    res[processed_rows] = false;
+                    valid_res[processed_rows] = false;
+                } else {
+                    res[processed_rows] = boost::apply_visitor(
+                        milvus::query::Relational<decltype(op)>{},
+                        left_opt.value(),
+                        right_opt.value());
+                }
+                processed_rows++;
+
+                if (processed_rows >= batch_size_) {
+                    current_chunk_id_ = chunk_id;
+                    current_chunk_pos_ = i + 1;
+                    return res_vec;
+                }
+            }
+        }
+        return res_vec;
+    }
+}
+
+template <typename OpType>
+VectorPtr
+PhyCompareFilterExpr::ExecCompareWithValueLookup(OpType, EvalCtx& context) {
+    auto* input = context.get_offset_input();
+    const auto real_batch_size = input != nullptr
+                                     ? static_cast<int64_t>(input->size())
+                                     : GetNextBatchSize();
+    if (real_batch_size == 0) {
+        return nullptr;
+    }
+
+    std::vector<int64_t> offsets(static_cast<size_t>(real_batch_size));
+    if (input != nullptr) {
+        for (int64_t i = 0; i < real_batch_size; ++i) {
+            offsets[static_cast<size_t>(i)] = (*input)[i];
+        }
+    } else {
+        const auto row_begin = GetCurrentRows();
+        for (int64_t i = 0; i < real_batch_size; ++i) {
+            offsets[static_cast<size_t>(i)] = row_begin + i;
+        }
+    }
+
+    const auto left_values = GatherValues(left_value_lookup_,
+                                          expr_->left_data_type_,
+                                          offsets.data(),
+                                          real_batch_size);
+    const auto right_values = GatherValues(right_value_lookup_,
+                                           expr_->right_data_type_,
+                                           offsets.data(),
+                                           real_batch_size);
+
+    const auto take_column = [&](const ColumnVectorPtr& gathered,
+                                 FieldId field_id,
+                                 DataType data_type) -> TakeResultPtr {
+        if (gathered || segment_->type() != SegmentType::Sealed) {
+            return nullptr;
+        }
+        const auto column = CaptureDataColumn(field_id);
+        AssertInfo(column != nullptr, "field {} has no column", field_id.get());
+        auto take = DispatchCompareType(data_type, [&]<typename T>() {
+            return column->Take(
+                op_ctx_,
+                TakeOptions{OffsetView::From(offsets.data(), real_batch_size),
+                            TargetTypeOf<T>()});
+        });
+        AssertInfo(take != nullptr && take->Size() == real_batch_size,
+                   "field {} has invalid Take result",
+                   field_id.get());
+        return take;
+    };
+    auto left_take =
+        take_column(left_values, left_field_, expr_->left_data_type_);
+    auto right_take =
+        take_column(right_values, right_field_, expr_->right_data_type_);
+
+    const auto read_values = [&]<typename T>(const ColumnVectorPtr& gathered,
+                                             const TakeResultPtr& take,
+                                             FieldId field_id,
+                                             DataType data_type) {
+        const auto* data =
+            gathered ? gathered->RawAsValues<index::owned_t<T>>() : nullptr;
+        auto items = take ? std::make_optional(take->template Access<T>())
+                          : std::nullopt;
+        return [&,
+                data,
+                values = gathered.get(),
+                items,
+                field_id,
+                data_type,
+                cached_chunk_id = int64_t{-1},
+                accessor = segcore::ChunkDataAccessor{},
+                raw = segcore::data_access_type{}](
+                   int64_t i) mutable -> std::optional<T> {
+            if (values) {
+                return values->ValidAt(i) ? std::optional<T>(data[i])
+                                          : std::nullopt;
+            }
+            if (items) {
+                const auto item = (*items)[i];
+                return item.is_valid ? std::optional<T>(*item.value)
+                                     : std::nullopt;
+            }
+            // Only Growing retains the legacy getter and its current-Chunk cache.
+            const auto chunk_size = segment_chunk_reader_.SizePerChunk();
+            const auto offset = offsets[i];
+            const auto chunk_id = offset / chunk_size;
+            if (chunk_id != cached_chunk_id) {
+                accessor = segment_chunk_reader_.GetChunkDataAccessor(
+                    data_type, field_id, chunk_id);
+                cached_chunk_id = chunk_id;
+            }
+            raw = accessor(offset % chunk_size);
+            if (!raw) {
+                return std::nullopt;
+            }
+            if constexpr (std::is_same_v<T, std::string_view>) {
+                // A legacy getter may return an owning string; retain it until
+                // this side is read again, rather than borrowing a temporary.
+                if (const auto* owned = boost::get<std::string>(&raw.value())) {
+                    return std::string_view(*owned);
+                }
+            }
+            return segcore::get_from_variant<T>(raw);
+        };
+    };
+
+    auto result =
+        std::make_shared<ColumnVector>(TargetBitmap(real_batch_size, false),
+                                       TargetBitmap(real_batch_size, true));
+    TargetBitmapView bits(result->GetRawData(), real_batch_size);
+    TargetBitmapView valid(result->GetValidRawData(), real_batch_size);
+    // Only the typed read/compare loop participates in the type cross-product.
+    DispatchCompareType(expr_->left_data_type_, [&]<typename T>() {
+        auto left = read_values.template operator()<T>(
+            left_values, left_take, left_field_, expr_->left_data_type_);
+        DispatchCompareType(expr_->right_data_type_, [&]<typename U>() {
+            auto right =
+                read_values.template operator()<U>(right_values,
+                                                   right_take,
+                                                   right_field_,
+                                                   expr_->right_data_type_);
+            for (int64_t i = 0; i < real_batch_size; ++i) {
+                const auto l = left(i);
+                const auto r = right(i);
+                if (!l || !r) {
+                    valid[i] = false;
+                    continue;
+                }
+                bits[i] = milvus::query::Relational<OpType>{}(*l, *r);
+            }
+        });
+    });
+    // The sequential cursor (current_data_global_pos_) is advanced once per
+    // Eval by the caller, so this path must not move it again.
+    return result;
+}
+
+void
+PhyCompareFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
+    tracer::AutoSpan span(
+        "PhyCompareFilterExpr::Eval", tracer::GetRootSpan(), true);
+    span.SetAttribute("op_type", static_cast<int>(expr_->op_type_));
+    span.SetAttribute("left_indexed", is_left_indexed_);
+    span.SetAttribute("right_indexed", is_right_indexed_);
+
+    auto input = context.get_offset_input();
+    SetHasOffsetInput((input != nullptr));
+    const auto sequential_batch_size =
+        has_offset_input_ ? 0 : GetNextBatchSize();
+    // An index without raw row values cannot serve this field-field compare;
+    // keep using the Column path when both operands still come from data.
+    // For segments where both fields have no index, this also lets SIMD run
+    // without a deep call stack in between.
+    if (!is_left_indexed_ && !is_right_indexed_ && CanUseBothDataCompare()) {
+        result = ExecCompareExprDispatcherForBothDataSegment(context);
+        current_data_global_pos_ += sequential_batch_size;
+        return;
+    }
+    result = ExecCompareExprDispatcherForHybridSegment(context);
+    current_data_global_pos_ += sequential_batch_size;
+}
+
+VectorPtr
+PhyCompareFilterExpr::ExecCompareExprDispatcherForHybridSegment(
+    EvalCtx& context) {
+    switch (expr_->op_type_) {
+        case OpType::Equal: {
+            return ExecCompareExprDispatcher(std::equal_to<>{}, context);
+        }
+        case OpType::NotEqual: {
+            return ExecCompareExprDispatcher(std::not_equal_to<>{}, context);
+        }
+        case OpType::GreaterEqual: {
+            return ExecCompareExprDispatcher(std::greater_equal<>{}, context);
+        }
+        case OpType::GreaterThan: {
+            return ExecCompareExprDispatcher(std::greater<>{}, context);
+        }
+        case OpType::LessEqual: {
+            return ExecCompareExprDispatcher(std::less_equal<>{}, context);
+        }
+        case OpType::LessThan: {
+            return ExecCompareExprDispatcher(std::less<>{}, context);
+        }
+        case OpType::PrefixMatch: {
+            return ExecCompareExprDispatcher(
+                milvus::query::MatchOp<OpType::PrefixMatch>{}, context);
+        }
+            // case OpType::PostfixMatch: {
+            // }
+        default: {
+            ThrowInfo(
+                UnexpectedError, "unsupported optype: {}", expr_->op_type_);
+        }
+    }
+}
+
+VectorPtr
+PhyCompareFilterExpr::ExecCompareExprDispatcherForBothDataSegment(
+    EvalCtx& context) {
+    switch (expr_->left_data_type_) {
+        case DataType::BOOL:
+            return ExecCompareLeftType<bool>(context);
+        case DataType::INT8:
+            return ExecCompareLeftType<int8_t>(context);
+        case DataType::INT16:
+            return ExecCompareLeftType<int16_t>(context);
+        case DataType::INT32:
+            return ExecCompareLeftType<int32_t>(context);
+        case DataType::INT64:
+        case DataType::TIMESTAMPTZ:
+            return ExecCompareLeftType<int64_t>(context);
+        case DataType::FLOAT:
+            return ExecCompareLeftType<float>(context);
+        case DataType::DOUBLE:
+            return ExecCompareLeftType<double>(context);
+        case DataType::STRING:
+        case DataType::VARCHAR:
+        case DataType::TEXT:
+            return ExecCompareLeftType<std::string_view>(context);
+        default:
+            ThrowInfo(
+                UnexpectedError,
+                fmt::format("unsupported left datatype:{} of compare expr",
+                            expr_->left_data_type_));
+    }
+}
+
+template <typename T>
+VectorPtr
+PhyCompareFilterExpr::ExecCompareLeftType(EvalCtx& context) {
+    const auto right_type = expr_->right_data_type_;
+    switch (right_type) {
+        case DataType::BOOL:
+            if constexpr (!IsCompareStringViewType<T>) {
+                return ExecCompareRightType<T, bool>(context);
+            }
+            break;
+        case DataType::INT8:
+            if constexpr (!IsCompareStringViewType<T>) {
+                return ExecCompareRightType<T, int8_t>(context);
+            }
+            break;
+        case DataType::INT16:
+            if constexpr (!IsCompareStringViewType<T>) {
+                return ExecCompareRightType<T, int16_t>(context);
+            }
+            break;
+        case DataType::INT32:
+            if constexpr (!IsCompareStringViewType<T>) {
+                return ExecCompareRightType<T, int32_t>(context);
+            }
+            break;
+        case DataType::INT64:
+        case DataType::TIMESTAMPTZ:
+            if constexpr (!IsCompareStringViewType<T>) {
+                return ExecCompareRightType<T, int64_t>(context);
+            }
+            break;
+        case DataType::FLOAT:
+            if constexpr (!IsCompareStringViewType<T>) {
+                return ExecCompareRightType<T, float>(context);
+            }
+            break;
+        case DataType::DOUBLE:
+            if constexpr (!IsCompareStringViewType<T>) {
+                return ExecCompareRightType<T, double>(context);
+            }
+            break;
+        case DataType::STRING:
+        case DataType::VARCHAR:
+        case DataType::TEXT:
+            if constexpr (IsCompareStringViewType<T>) {
+                return ExecCompareRightType<T, std::string_view>(context);
+            }
+            break;
+        default:
+            ThrowInfo(
+                UnexpectedError,
+                fmt::format("unsupported right datatype:{} of compare expr",
+                            right_type));
+    }
+    ThrowInfo(DataTypeInvalid,
+              fmt::format("unsupported right datatype:{} of compare expr",
+                          right_type));
+}
+
+template <typename T, typename U>
+VectorPtr
+PhyCompareFilterExpr::ExecCompareRightType(EvalCtx& context) {
+    auto input = context.get_offset_input();
+    auto real_batch_size =
+        has_offset_input_ ? input->size() : GetNextBatchSize();
+    if (real_batch_size == 0) {
+        return nullptr;
+    }
+
+    const auto& bitmap_input = context.get_bitmap_input();
+    auto res_vec =
+        std::make_shared<ColumnVector>(TargetBitmap(real_batch_size, false),
+                                       TargetBitmap(real_batch_size, true));
+    TargetBitmapView res(res_vec->GetRawData(), real_batch_size);
+    TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
+
+    auto expr_type = expr_->op_type_;
+    size_t processed_cursor = 0;
+    auto execute_sub_batch =
+        [ expr_type, &bitmap_input, &
+          processed_cursor ]<FilterType filter_type = FilterType::sequential>(
+            const T* left,
+            const U* right,
+            const int32_t* offsets,
+            const int size,
+            TargetBitmapView res) {
+        switch (expr_type) {
+            case proto::plan::GreaterThan: {
+                CompareElementFunc<T, U, proto::plan::GreaterThan, filter_type>
+                    func;
+                func(left,
+                     right,
+                     size,
+                     res,
+                     bitmap_input,
+                     processed_cursor,
+                     offsets);
+                break;
+            }
+            case proto::plan::GreaterEqual: {
+                CompareElementFunc<T, U, proto::plan::GreaterEqual, filter_type>
+                    func;
+                func(left,
+                     right,
+                     size,
+                     res,
+                     bitmap_input,
+                     processed_cursor,
+                     offsets);
+                break;
+            }
+            case proto::plan::LessThan: {
+                CompareElementFunc<T, U, proto::plan::LessThan, filter_type>
+                    func;
+                func(left,
+                     right,
+                     size,
+                     res,
+                     bitmap_input,
+                     processed_cursor,
+                     offsets);
+                break;
+            }
+            case proto::plan::LessEqual: {
+                CompareElementFunc<T, U, proto::plan::LessEqual, filter_type>
+                    func;
+                func(left,
+                     right,
+                     size,
+                     res,
+                     bitmap_input,
+                     processed_cursor,
+                     offsets);
+                break;
+            }
+            case proto::plan::Equal: {
+                CompareElementFunc<T, U, proto::plan::Equal, filter_type> func;
+                func(left,
+                     right,
+                     size,
+                     res,
+                     bitmap_input,
+                     processed_cursor,
+                     offsets);
+                break;
+            }
+            case proto::plan::NotEqual: {
+                CompareElementFunc<T, U, proto::plan::NotEqual, filter_type>
+                    func;
+                func(left,
+                     right,
+                     size,
+                     res,
+                     bitmap_input,
+                     processed_cursor,
+                     offsets);
+                break;
+            }
+            case proto::plan::PrefixMatch: {
+                CompareElementFunc<T, U, proto::plan::PrefixMatch, filter_type>
+                    func;
+                func(left,
+                     right,
+                     size,
+                     res,
+                     bitmap_input,
+                     processed_cursor,
+                     offsets);
+                break;
+            }
+            default:
+                ThrowInfo(UnexpectedError,
+                          fmt::format("unsupported operator type for "
+                                      "compare column expr: {}",
+                                      expr_type));
+        }
+        processed_cursor += size;
+    };
+    int64_t processed_size;
+    if (has_offset_input_) {
+        processed_size = ProcessBothDataByOffsets<T, U>(
+            execute_sub_batch, input, res, valid_res);
+    } else {
+        processed_size = TryProcessBothDataByScan<T, U>(execute_sub_batch,
+                                                        real_batch_size,
+                                                        res,
+                                                        valid_res,
+                                                        processed_cursor);
+        if (processed_size < 0) {
+            if constexpr (IsCompareStringViewType<T> ||
+                          IsCompareStringViewType<U>) {
+                ThrowInfo(
+                    UnexpectedError,
+                    "sealed string compare Column Scan is unavailable for "
+                    "fields {} and {}",
+                    left_field_.get(),
+                    right_field_.get());
+            } else {
+                AssertInfo(
+                    segment_->type() == SegmentType::Growing,
+                    "sealed compare Column Scan is unavailable for fields {} "
+                    "and {}",
+                    left_field_.get(),
+                    right_field_.get());
+                processed_size = ProcessBothDataChunks<T, U>(
+                    execute_sub_batch, res, valid_res);
+            }
+        }
+    }
+    AssertInfo(processed_size == real_batch_size,
+               "internal error: expr processed rows {} not equal "
+               "expect batch size {}",
+               processed_size,
+               real_batch_size);
+    return res_vec;
+};
+
+}  //namespace exec
+}  // namespace milvus

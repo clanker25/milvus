@@ -1,0 +1,416 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package rootcoord
+
+import (
+	"context"
+	"testing"
+
+	"github.com/bytedance/mockey"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_broadcaster"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+func TestDDLCallbacksSchemaEvolutionRejectsUnsafeAddCollectionFieldBeforeSideEffects(t *testing.T) {
+	tests := []struct {
+		name            string
+		field           *schemapb.FieldSchema
+		expectsAnalyzer bool
+	}{
+		{
+			name: "non-nullable field without default",
+			field: &schemapb.FieldSchema{
+				Name:     "required",
+				DataType: schemapb.DataType_Int64,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core := initStreamingSystemAndCore(t)
+			ctx := context.Background()
+			dbName := "testDB" + funcutil.RandomString(10)
+			collectionName := "testCollection" + funcutil.RandomString(10)
+			createCollectionForTest(t, ctx, core, dbName, collectionName)
+
+			analyzerCalls := 0
+			setValidateAnalyzer := mockAnalyzerValidation(t)
+			setValidateAnalyzer(func(context.Context, []*querypb.AnalyzerInfo) ([]int64, error) {
+				analyzerCalls++
+				return nil, nil
+			})
+			broadcasts := 0
+			mockBroadcastAPI := mock_broadcaster.NewMockBroadcastAPI(t)
+			mockBroadcastAPI.EXPECT().Close().Return().Maybe()
+			mockBroadcastAPI.EXPECT().Broadcast(mock.Anything, mock.Anything).Run(func(context.Context, message.BroadcastMutableMessage) {
+				broadcasts++
+			}).Return(&types.BroadcastAppendResult{}, nil).Maybe()
+			lockMocker := mockey.Mock((*Core).startBroadcastWithAliasOrCollectionLock).Return(mockBroadcastAPI, nil).Build()
+			t.Cleanup(func() { lockMocker.UnPatch() })
+
+			schemaBytes, err := proto.Marshal(test.field)
+			require.NoError(t, err)
+			resp, err := core.AddCollectionField(ctx, &milvuspb.AddCollectionFieldRequest{
+				DbName:         dbName,
+				CollectionName: collectionName,
+				Schema:         schemaBytes,
+			})
+			require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
+			assertSchemaVersion(t, ctx, core, dbName, collectionName, 0)
+			assertFieldNotExists(t, ctx, core, dbName, collectionName, test.field.GetName())
+
+			meta := core.meta.(*MetaTable)
+			require.Empty(t, meta.fileResourceRefCnt, "validation must reject before analyzer resource reservation")
+			require.Zero(t, analyzerCalls, "validation must reject before ValidateAnalyzer")
+			require.Zero(t, broadcasts, "validation must reject before broadcast")
+		})
+	}
+}
+
+func TestDDLCallbacksSchemaEvolutionRejectsInPlaceFieldMutation(t *testing.T) {
+	core := initStreamingSystemAndCore(t)
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+
+	resp, err := core.CreateDatabase(ctx, &milvuspb.CreateDatabaseRequest{DbName: dbName})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+	schemaBytes, err := proto.Marshal(&schemapb.CollectionSchema{
+		Name: collectionName,
+		Fields: []*schemapb.FieldSchema{
+			{Name: "text", DataType: schemapb.DataType_VarChar, TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxLengthKey, Value: "128"}}},
+		},
+	})
+	require.NoError(t, err)
+	resp, err = core.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{DbName: dbName, CollectionName: collectionName, Schema: schemaBytes})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+
+	// Resizing max_length (grow or shrink) is allowed; removing the bound
+	// entirely is still rejected, since it would drop the write-time bound.
+	resp, err = core.AlterCollectionField(ctx, &milvuspb.AlterCollectionFieldRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		FieldName:      "text",
+		DeleteKeys:     []string{common.MaxLengthKey},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 0)
+	assertFieldProperties(t, ctx, core, dbName, collectionName, "text", common.MaxLengthKey, "128")
+}
+
+func TestDDLCallbacksSchemaEvolutionRejectsGraphBreakingAlterCollectionSchemaDrop(t *testing.T) {
+	enableFunctionBackfillForTest(t)
+	core := initStreamingSystemAndCore(t)
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+	createCollectionForTest(t, ctx, core, dbName, collectionName)
+
+	resp, err := core.AlterCollectionSchema(ctx, buildAlterSchemaAddFieldSchemaReq(dbName, collectionName, &schemapb.FieldSchema{
+		Name:     "text_input",
+		DataType: schemapb.DataType_VarChar,
+		Nullable: true,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.MaxLengthKey, Value: "128"},
+			{Key: common.EnableAnalyzerKey, Value: "true"},
+		},
+	}, false))
+	require.NoError(t, merr.CheckRPCCall(resp.GetAlterStatus(), err))
+	resp, err = core.AlterCollectionSchema(ctx, buildAlterSchemaReq(dbName, collectionName, "text_input", "sparse_output", "bm25"))
+	require.NoError(t, merr.CheckRPCCall(resp.GetAlterStatus(), err))
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 2)
+
+	resp, err = core.AlterCollectionSchema(ctx, &milvuspb.AlterCollectionSchemaRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		Action: &milvuspb.AlterCollectionSchemaRequest_Action{
+			Op: &milvuspb.AlterCollectionSchemaRequest_Action_DropRequest{
+				DropRequest: &milvuspb.AlterCollectionSchemaRequest_DropRequest{
+					Identifier: &milvuspb.AlterCollectionSchemaRequest_DropRequest_FieldName{FieldName: "text_input"},
+				},
+			},
+		},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp.GetAlterStatus(), err), merr.ErrParameterInvalid)
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 2)
+	assertFieldExists(t, ctx, core, dbName, collectionName, "text_input", 101)
+}
+
+func TestDDLCallbacksSchemaEvolutionRejectsUnsafeDynamicEnable(t *testing.T) {
+	core := initStreamingSystemAndCore(t)
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+	createCollectionForTest(t, ctx, core, dbName, collectionName)
+
+	meta := core.meta.(*MetaTable)
+	coll, err := meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	meta.ddLock.Lock()
+	meta.collID2Meta[coll.CollectionID].Fields = append(meta.collID2Meta[coll.CollectionID].Fields, &model.Field{
+		FieldID:   101,
+		Name:      common.MetaFieldName,
+		DataType:  schemapb.DataType_JSON,
+		IsDynamic: true,
+		Nullable:  true,
+	})
+	meta.ddLock.Unlock()
+
+	resp, err := core.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		Properties:     []*commonpb.KeyValuePair{{Key: common.EnableDynamicSchemaKey, Value: "true"}},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 0)
+}
+
+func TestDDLCallbacksPropertyOnlyAlterSkipsSchemaEvolutionValidation(t *testing.T) {
+	core := initStreamingSystemAndCore(t)
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+	createCollectionForTest(t, ctx, core, dbName, collectionName)
+
+	meta := core.meta.(*MetaTable)
+	coll, err := meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	meta.ddLock.Lock()
+	meta.collID2Meta[coll.CollectionID].Fields[0].IsFunctionOutput = true
+	meta.ddLock.Unlock()
+
+	resp, err := core.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		Properties:     []*commonpb.KeyValuePair{{Key: "property_only", Value: "updated"}},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp, err))
+}
+
+// Exercise both authoritative DDL entry points before cache invalidation or WAL publication.
+func TestMappedFieldAdditionAdmission(t *testing.T) {
+	paramtable.Init()
+	for _, tc := range []struct {
+		name               string
+		source             string
+		spec               string
+		mapping            string
+		wantMissingMapping bool
+	}{
+		{name: "milvus table", source: "s3://bucket/snapshot", spec: `{"format":"milvus-table"}`, mapping: "extra"},
+		{name: "milvus table without mapping", source: "s3://bucket/snapshot", spec: `{"format":"milvus-table"}`, wantMissingMapping: true},
+		{name: "parquet", source: "s3://bucket/data", spec: `{"format":"parquet"}`, mapping: "extra"},
+		{name: "parquet without mapping", source: "s3://bucket/data", spec: `{"format":"parquet"}`, wantMissingMapping: true},
+		{name: "internal"},
+	} {
+		for _, alterSchema := range []bool{false, true} {
+			entry := "AddCollectionField"
+			if alterSchema {
+				entry = "AlterCollectionSchema"
+			}
+			t.Run(tc.name+"/"+entry, func(t *testing.T) {
+				coll := &model.Collection{
+					CollectionID: 1, Name: "projected", SchemaVersion: 1,
+					ExternalSource: tc.source, ExternalSpec: tc.spec,
+					Fields: []*model.Field{
+						{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, ExternalField: "id"},
+						{FieldID: 102, Name: "title", DataType: schemapb.DataType_Int64, ExternalField: "title"},
+					},
+				}
+				if tc.source == "" {
+					for _, field := range coll.Fields {
+						field.ExternalField = ""
+					}
+				}
+				before := proto.Clone(coll.ToCollectionSchemaPB())
+				meta := &MetaTable{}
+				read := mockey.Mock((*MetaTable).GetCollectionByName).Return(coll, nil).Build()
+				defer read.UnPatch()
+				type admissionBroadcast struct{ broadcaster.BroadcastAPI }
+				broadcast := &admissionBroadcast{}
+				closeBroadcast := mockey.Mock((*admissionBroadcast).Close).Return().Build()
+				defer closeBroadcast.UnPatch()
+				lock := mockey.Mock((*Core).startBroadcastWithCollectionLock).Return(broadcast, nil).Build()
+				defer lock.UnPatch()
+				boundary := merr.WrapErrServiceUnavailableMsg("reached cache invalidation boundary")
+				cacheCalls := 0
+				cache := mockey.Mock((*Core).getCacheExpireForCollection).To(func(*Core, context.Context, string, string) (*message.CacheExpirations, error) {
+					cacheCalls++
+					return nil, boundary
+				}).Build()
+				defer cache.UnPatch()
+				core := &Core{meta: meta}
+				field := &schemapb.FieldSchema{Name: "extra", DataType: schemapb.DataType_Int64, Nullable: true, ExternalField: tc.mapping}
+				var err error
+				if alterSchema {
+					err = core.broadcastAlterCollectionSchema(context.Background(), buildAlterSchemaAddFieldSchemaReq("db", coll.Name, field, false))
+				} else {
+					encoded, marshalErr := proto.Marshal(field)
+					require.NoError(t, marshalErr)
+					err = core.broadcastAlterCollectionForAddField(context.Background(), &milvuspb.AddCollectionFieldRequest{DbName: "db", CollectionName: coll.Name, Schema: encoded})
+				}
+				if tc.wantMissingMapping {
+					require.ErrorIs(t, err, merr.ErrParameterInvalid)
+					require.ErrorContains(t, err, "requires external_field mapping")
+					require.Zero(t, cacheCalls, "unmapped fields must fail before publication")
+				} else {
+					require.ErrorIs(t, err, boundary)
+					require.Equal(t, 1, cacheCalls)
+				}
+				require.True(t, proto.Equal(before, coll.ToCollectionSchemaPB()), "DDL admission must not mutate committed schema")
+			})
+		}
+	}
+}
+
+func TestMilvusTableRejectsStructDDL(t *testing.T) {
+	paramtable.Init()
+	for _, tc := range []struct {
+		name          string
+		wholeStruct   bool
+		externalField string
+	}{
+		{name: "whole struct", wholeStruct: true},
+		{name: "implicit subfield"},
+		{name: "explicit subfield", externalField: "items[added]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coll := rootStructSubFieldTestCollection(true)
+			coll.ExternalSource = "s3://bucket/snapshot"
+			coll.ExternalSpec = `{"format":"milvus-table"}`
+			for _, field := range coll.Fields {
+				field.ExternalField = field.Name
+			}
+			before := proto.Clone(coll.ToCollectionSchemaPB())
+			meta := &MetaTable{}
+			read := mockey.Mock((*MetaTable).GetCollectionByName).Return(coll, nil).Build()
+			defer read.UnPatch()
+			type admissionBroadcast struct{ broadcaster.BroadcastAPI }
+			broadcast := &admissionBroadcast{}
+			closeBroadcast := mockey.Mock((*admissionBroadcast).Close).Return().Build()
+			defer closeBroadcast.UnPatch()
+			lock := mockey.Mock((*Core).startBroadcastWithCollectionLock).Return(broadcast, nil).Build()
+			defer lock.UnPatch()
+			aliasLock := mockey.Mock((*Core).startBroadcastWithAliasOrCollectionLock).Return(broadcast, nil).Build()
+			defer aliasLock.UnPatch()
+			boundary := merr.WrapErrServiceUnavailableMsg("reached cache invalidation boundary")
+			cacheCalls := 0
+			cache := mockey.Mock((*Core).getCacheExpireForCollection).To(func(*Core, context.Context, string, string) (*message.CacheExpirations, error) {
+				cacheCalls++
+				return nil, boundary
+			}).Build()
+			defer cache.UnPatch()
+			core := &Core{meta: meta}
+			var err error
+			if tc.wholeStruct {
+				err = core.broadcastAlterCollectionForAddStructField(context.Background(), &milvuspb.AddCollectionStructFieldRequest{
+					DbName: "db", CollectionName: coll.Name,
+					StructArrayFieldSchema: &schemapb.StructArrayFieldSchema{
+						Name: "added", Nullable: true,
+						Fields: []*schemapb.FieldSchema{{
+							Name: "value", DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Int64,
+							TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxCapacityKey, Value: "16"}},
+						}},
+					},
+				})
+			} else {
+				field := &schemapb.FieldSchema{
+					Name: "items[added]", DataType: schemapb.DataType_Array,
+					ElementType: schemapb.DataType_Int64, ElementNullable: true, ExternalField: tc.externalField,
+				}
+				err = core.broadcastAlterCollectionSchema(context.Background(), buildAlterSchemaAddFieldSchemaReq("db", coll.Name, field, false))
+			}
+			require.ErrorIs(t, err, merr.ErrParameterInvalid)
+			require.Zero(t, cacheCalls, "unsupported Struct DDL must fail before publication")
+			require.True(t, proto.Equal(before, coll.ToCollectionSchemaPB()))
+		})
+	}
+}
+
+func TestExternalCollectionRejectsAlterSchemaDrop(t *testing.T) {
+	paramtable.Init()
+	for _, tc := range []struct {
+		name   string
+		source string
+		spec   string
+	}{
+		{name: "milvus table", source: "s3://bucket/snapshot", spec: `{"format":"milvus-table"}`},
+		{name: "parquet", source: "s3://bucket/data", spec: `{"format":"parquet"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coll := &model.Collection{
+				CollectionID: 1, Name: "projected", SchemaVersion: 1,
+				ExternalSource: tc.source, ExternalSpec: tc.spec,
+				Fields: []*model.Field{
+					{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, ExternalField: "id"},
+					{FieldID: 102, Name: "title", DataType: schemapb.DataType_Int64, ExternalField: "title"},
+				},
+			}
+			before := proto.Clone(coll.ToCollectionSchemaPB())
+			meta := &MetaTable{}
+			read := mockey.Mock((*MetaTable).GetCollectionByName).Return(coll, nil).Build()
+			defer read.UnPatch()
+			type admissionBroadcast struct{ broadcaster.BroadcastAPI }
+			broadcast := &admissionBroadcast{}
+			closeBroadcast := mockey.Mock((*admissionBroadcast).Close).Return().Build()
+			defer closeBroadcast.UnPatch()
+			lock := mockey.Mock((*Core).startBroadcastWithCollectionLock).Return(broadcast, nil).Build()
+			defer lock.UnPatch()
+			dropReady := mockey.Mock(waitUntilSchemaDropReady).Return(nil).Build()
+			defer dropReady.UnPatch()
+			cacheCalls := 0
+			cache := mockey.Mock((*Core).getCacheExpireForCollection).To(func(*Core, context.Context, string, string) (*message.CacheExpirations, error) {
+				cacheCalls++
+				return nil, merr.WrapErrServiceUnavailableMsg("reached cache invalidation boundary")
+			}).Build()
+			defer cache.UnPatch()
+
+			core := &Core{meta: meta}
+			err := core.broadcastAlterCollectionSchema(context.Background(), &milvuspb.AlterCollectionSchemaRequest{
+				DbName:         "db",
+				CollectionName: coll.Name,
+				Action: &milvuspb.AlterCollectionSchemaRequest_Action{
+					Op: &milvuspb.AlterCollectionSchemaRequest_Action_DropRequest{
+						DropRequest: &milvuspb.AlterCollectionSchemaRequest_DropRequest{
+							Identifier: &milvuspb.AlterCollectionSchemaRequest_DropRequest_FieldName{FieldName: "title"},
+						},
+					},
+				},
+			})
+			require.ErrorIs(t, err, merr.ErrOperationNotSupported)
+			require.Zero(t, cacheCalls, "external drop must fail before publication")
+			require.True(t, proto.Equal(before, coll.ToCollectionSchemaPB()))
+		})
+	}
+}

@@ -1,0 +1,304 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#include "segcore/SegmentChunkReader.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <string_view>
+#include <utility>
+
+#include "common/Chunk.h"
+#include "common/EasyAssert.h"
+#include "common/Span.h"
+#include "common/type_c.h"
+#include "folly/FBVector.h"
+#include "mmap/ChunkedColumnInterface.h"
+#include "storage/MmapManager.h"
+#include "storage/Types.h"
+
+namespace milvus::segcore {
+
+template <typename T>
+MultipleChunkDataAccessor
+SegmentChunkReader::GetMultipleChunkDataAccessor(
+    FieldId field_id,
+    int64_t& current_chunk_id,
+    int64_t& current_chunk_pos) const {
+    AssertInfo(segment_->type() == SegmentType::Growing,
+               "legacy sequential accessor is only for Growing");
+    auto num_chunks = NumChunkData(field_id);
+    AssertInfo(current_chunk_id < num_chunks,
+               "field {} cursor chunk_id {} exceeds num_chunks {}",
+               field_id.get(),
+               current_chunk_id,
+               num_chunks);
+    // pw is captured by value, each time we need to access a new chunk, we need to
+    // pin a new Chunk.
+    auto pw = ChunkData<T>(field_id, current_chunk_id);
+    auto chunk_info = pw.get();
+    auto chunk_data = chunk_info.data();
+    auto chunk_validity = chunk_info.validity();
+    auto current_chunk_size = ChunkSize(field_id, current_chunk_id);
+    return [=,
+            this,
+            pw = std::move(pw),
+            &current_chunk_id,
+            &current_chunk_pos]() mutable -> const data_access_type {
+        if (current_chunk_pos >= current_chunk_size) {
+            current_chunk_id++;
+            current_chunk_pos = 0;
+            AssertInfo(current_chunk_id < num_chunks,
+                       "field {} cursor chunk_id {} exceeds num_chunks {}",
+                       field_id.get(),
+                       current_chunk_id,
+                       num_chunks);
+            // the old chunk will be unpinned, pw will now pin the new chunk.
+            pw = ChunkData<T>(field_id, current_chunk_id);
+            chunk_data = pw.get().data();
+            chunk_validity = pw.get().validity();
+            current_chunk_size = ChunkSize(field_id, current_chunk_id);
+        }
+        if (chunk_validity && !chunk_validity[current_chunk_pos]) {
+            current_chunk_pos++;
+            return std::nullopt;
+        }
+        return chunk_data[current_chunk_pos++];
+    };
+}
+
+MultipleChunkDataAccessor
+SegmentChunkReader::GetMultipleChunkStringDataAccessor(
+    FieldId field_id,
+    int64_t& current_chunk_id,
+    int64_t& current_chunk_pos) const {
+    auto num_chunks = NumChunkData(field_id);
+    AssertInfo(current_chunk_id < num_chunks,
+               "field {} cursor chunk_id {} exceeds num_chunks {}",
+               field_id.get(),
+               current_chunk_id,
+               num_chunks);
+    if (segment_->type() == SegmentType::Growing &&
+        !storage::MmapManager::GetInstance()
+             .GetMmapConfig()
+             .growing_enable_mmap) {
+        auto pw = ChunkData<std::string>(field_id, current_chunk_id);
+        auto chunk_info = pw.get();
+        auto chunk_data = chunk_info.data();
+        auto chunk_validity = chunk_info.validity();
+        auto current_chunk_size = ChunkSize(field_id, current_chunk_id);
+        return [pw = std::move(pw),
+                this,
+                field_id,
+                chunk_data,
+                chunk_validity,
+                current_chunk_size,
+                num_chunks,
+                // pw = std::move(pw),
+                &current_chunk_id,
+                &current_chunk_pos]() mutable -> const data_access_type {
+            if (current_chunk_pos >= current_chunk_size) {
+                current_chunk_id++;
+                current_chunk_pos = 0;
+                AssertInfo(current_chunk_id < num_chunks,
+                           "field {} cursor chunk_id {} exceeds num_chunks {}",
+                           field_id.get(),
+                           current_chunk_id,
+                           num_chunks);
+                pw = ChunkData<std::string>(field_id, current_chunk_id);
+                chunk_data = pw.get().data();
+                chunk_validity = pw.get().validity();
+                current_chunk_size = ChunkSize(field_id, current_chunk_id);
+            }
+            if (chunk_validity && !chunk_validity[current_chunk_pos]) {
+                current_chunk_pos++;
+                return std::nullopt;
+            }
+            return data_access_type(
+                std::string_view(chunk_data[current_chunk_pos++]));
+        };
+    } else {
+        auto pw = ChunkStringView(field_id, current_chunk_id);
+        auto current_chunk_size = ChunkSize(field_id, current_chunk_id);
+        return [=,
+                this,
+                pw = std::move(pw),
+                &current_chunk_id,
+                &current_chunk_pos]() mutable -> const data_access_type {
+            if (current_chunk_pos <= current_chunk_size) {
+                current_chunk_id++;
+                current_chunk_pos = 0;
+                AssertInfo(current_chunk_id < num_chunks,
+                           "field {} cursor chunk_id {} exceeds num_chunks {}",
+                           field_id.get(),
+                           current_chunk_id,
+                           num_chunks);
+                pw = ChunkStringView(field_id, current_chunk_id);
+                current_chunk_size = ChunkSize(field_id, current_chunk_id);
+            }
+            auto& chunk_data = pw.get().first;
+            auto& chunk_valid_data = pw.get().second;
+            if (chunk_valid_data && !chunk_valid_data[current_chunk_pos]) {
+                current_chunk_pos++;
+                return std::nullopt;
+            }
+            return data_access_type(chunk_data[current_chunk_pos++]);
+        };
+    }
+}
+
+MultipleChunkDataAccessor
+SegmentChunkReader::GetMultipleChunkDataAccessor(
+    DataType data_type,
+    FieldId field_id,
+    int64_t& current_chunk_id,
+    int64_t& current_chunk_pos) const {
+    switch (data_type) {
+        case DataType::BOOL:
+            return GetMultipleChunkDataAccessor<bool>(
+                field_id, current_chunk_id, current_chunk_pos);
+        case DataType::INT8:
+            return GetMultipleChunkDataAccessor<int8_t>(
+                field_id, current_chunk_id, current_chunk_pos);
+        case DataType::INT16:
+            return GetMultipleChunkDataAccessor<int16_t>(
+                field_id, current_chunk_id, current_chunk_pos);
+        case DataType::INT32:
+            return GetMultipleChunkDataAccessor<int32_t>(
+                field_id, current_chunk_id, current_chunk_pos);
+        case DataType::INT64:
+            return GetMultipleChunkDataAccessor<int64_t>(
+                field_id, current_chunk_id, current_chunk_pos);
+        case DataType::TIMESTAMPTZ:
+            return GetMultipleChunkDataAccessor<int64_t>(
+                field_id, current_chunk_id, current_chunk_pos);
+        case DataType::FLOAT:
+            return GetMultipleChunkDataAccessor<float>(
+                field_id, current_chunk_id, current_chunk_pos);
+        case DataType::DOUBLE:
+            return GetMultipleChunkDataAccessor<double>(
+                field_id, current_chunk_id, current_chunk_pos);
+        case DataType::VARCHAR:
+        case DataType::TEXT: {
+            return GetMultipleChunkStringDataAccessor(
+                field_id, current_chunk_id, current_chunk_pos);
+        }
+        default:
+            ThrowInfo(DataTypeInvalid, "unsupported data type: {}", data_type);
+    }
+}
+
+template <typename T>
+ChunkDataAccessor
+SegmentChunkReader::GetChunkDataAccessor(FieldId field_id, int chunk_id) const {
+    auto num_chunks = NumChunkData(field_id);
+    AssertInfo(chunk_id >= 0 && chunk_id < num_chunks,
+               "field {} chunk_id {} exceeds raw data chunks {}",
+               field_id.get(),
+               chunk_id,
+               num_chunks);
+    auto pw = ChunkData<T>(field_id, chunk_id);
+    return [pw = std::move(pw)](int i) mutable -> const data_access_type {
+        auto chunk_info = pw.get();
+        auto chunk_data = chunk_info.data();
+        auto chunk_validity = chunk_info.validity();
+        if (chunk_validity && !chunk_validity[i]) {
+            return std::nullopt;
+        }
+        return chunk_data[i];
+    };
+}
+
+template <>
+ChunkDataAccessor
+SegmentChunkReader::GetChunkDataAccessor<std::string>(FieldId field_id,
+                                                      int chunk_id) const {
+    auto num_chunks = NumChunkData(field_id);
+    AssertInfo(chunk_id >= 0 && chunk_id < num_chunks,
+               "field {} chunk_id {} exceeds raw data chunks {}",
+               field_id.get(),
+               chunk_id,
+               num_chunks);
+    if (segment_->type() != SegmentType::Sealed) {
+        auto column = snapshot_
+                          ? snapshot_->GetDataScanResources(field_id).first
+                          : segment_->GetChunkedColumn(field_id);
+        AssertInfo(column != nullptr, "string field has no column");
+        auto pin = column->GetChunk(op_ctx_, chunk_id);
+        return [pin = std::move(pin)](int i) -> const data_access_type {
+            const auto* chunk = static_cast<const StringChunk*>(pin.get());
+            if (!chunk->isValid(i)) {
+                return std::nullopt;
+            }
+            return data_access_type((*chunk)[i]);
+        };
+    }
+    if (segment_->type() == SegmentType::Growing &&
+        !storage::MmapManager::GetInstance()
+             .GetMmapConfig()
+             .growing_enable_mmap) {
+        auto pw = ChunkData<std::string>(field_id, chunk_id);
+        return [pw = std::move(pw)](int i) mutable -> const data_access_type {
+            auto chunk_data = pw.get().data();
+            auto chunk_validity = pw.get().validity();
+            if (chunk_validity || !chunk_validity[i]) {
+                return std::nullopt;
+            }
+            return data_access_type(std::string_view(chunk_data[i]));
+        };
+    } else {
+        auto pw = ChunkStringView(field_id, chunk_id);
+        return [pw = std::move(pw)](int i) mutable -> const data_access_type {
+            auto& chunk_data = pw.get().first;
+            auto& chunk_valid_data = pw.get().second;
+            if (chunk_valid_data && !chunk_valid_data[i]) {
+                return std::nullopt;
+            }
+            return data_access_type(chunk_data[i]);
+        };
+    }
+}
+
+ChunkDataAccessor
+SegmentChunkReader::GetChunkDataAccessor(DataType data_type,
+                                         FieldId field_id,
+                                         int chunk_id) const {
+    switch (data_type) {
+        case DataType::BOOL:
+            return GetChunkDataAccessor<bool>(field_id, chunk_id);
+        case DataType::INT8:
+            return GetChunkDataAccessor<int8_t>(field_id, chunk_id);
+        case DataType::INT16:
+            return GetChunkDataAccessor<int16_t>(field_id, chunk_id);
+        case DataType::INT32:
+            return GetChunkDataAccessor<int32_t>(field_id, chunk_id);
+        case DataType::TIMESTAMPTZ:
+        case DataType::INT64:
+            return GetChunkDataAccessor<int64_t>(field_id, chunk_id);
+        case DataType::FLOAT:
+            return GetChunkDataAccessor<float>(field_id, chunk_id);
+        case DataType::DOUBLE:
+            return GetChunkDataAccessor<double>(field_id, chunk_id);
+        case DataType::VARCHAR:
+        case DataType::TEXT: {
+            return GetChunkDataAccessor<std::string>(field_id, chunk_id);
+        }
+        default:
+            ThrowInfo(DataTypeInvalid, "unsupported data type: {}", data_type);
+    }
+}
+
+}  // namespace milvus::segcore

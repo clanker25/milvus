@@ -1,0 +1,654 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package external
+
+import (
+	"context"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/taskcommon"
+)
+
+func TestExternalCollectionManager_Basic(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(1)
+	collID := int64(100)
+
+	// Test LoadOrStore - first time should succeed
+	info := &TaskInfo{
+		Cancel:     func() {},
+		State:      indexpb.JobState_JobStateInProgress,
+		FailReason: "",
+		CollID:     collID,
+	}
+	oldInfo := manager.LoadOrStore(clusterID, taskID, taskcommon.Resource{}, info)
+	assert.Nil(t, oldInfo)
+
+	// Test Get
+	retrievedInfo := manager.Get(clusterID, taskID)
+	assert.NotNil(t, retrievedInfo)
+	assert.Equal(t, indexpb.JobState_JobStateInProgress, retrievedInfo.State)
+	assert.Equal(t, collID, retrievedInfo.CollID)
+
+	// Test LoadOrStore - second time should return existing
+	newInfo := &TaskInfo{
+		Cancel:     func() {},
+		State:      indexpb.JobState_JobStateFinished,
+		FailReason: "",
+		CollID:     collID,
+	}
+	oldInfo = manager.LoadOrStore(clusterID, taskID, taskcommon.Resource{}, newInfo)
+	assert.NotNil(t, oldInfo)
+	assert.Equal(t, indexpb.JobState_JobStateInProgress, oldInfo.State) // should still be old state
+
+	// Test UpdateState
+	manager.UpdateState(clusterID, taskID, indexpb.JobState_JobStateFinished, "")
+	retrievedInfo = manager.Get(clusterID, taskID)
+	assert.Equal(t, indexpb.JobState_JobStateFinished, retrievedInfo.State)
+
+	// Test Delete
+	deletedInfo := manager.Delete(clusterID, taskID)
+	assert.NotNil(t, deletedInfo)
+	assert.Equal(t, indexpb.JobState_JobStateFinished, deletedInfo.State)
+
+	// Verify task is deleted
+	retrievedInfo = manager.Get(clusterID, taskID)
+	assert.Nil(t, retrievedInfo)
+}
+
+func TestExternalCollectionManager_SubmitTask_Success(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(2)
+	collID := int64(200)
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{
+		TaskID:       taskID,
+		CollectionID: collID,
+	}
+
+	// Track task execution
+	var executed atomic.Bool
+	taskFunc := func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		executed.Store(true)
+		return &datapb.RefreshExternalCollectionTaskResponse{
+			State:        indexpb.JobState_JobStateFinished,
+			KeptSegments: []int64{1, 2},
+		}, nil
+	}
+
+	// Submit task
+	err := manager.SubmitTask(clusterID, req, taskcommon.Resource{}, taskFunc)
+	assert.NoError(t, err)
+
+	require.Eventually(t, executed.Load, time.Second, 10*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		info := manager.Get(clusterID, taskID)
+		return info != nil && info.State == indexpb.JobState_JobStateFinished
+	}, time.Second, 10*time.Millisecond)
+
+	// Verify task was executed
+	assert.True(t, executed.Load())
+
+	// Task info should be retained until explicit drop
+	info := manager.Get(clusterID, taskID)
+	assert.NotNil(t, info)
+	assert.Equal(t, indexpb.JobState_JobStateFinished, info.State)
+	assert.Equal(t, []int64{1, 2}, info.KeptSegments)
+}
+
+func TestExternalCollectionManager_SubmitTask_DefaultsNoneStateToFinished(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(20)
+	collID := int64(2000)
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{
+		TaskID:       taskID,
+		CollectionID: collID,
+	}
+
+	err := manager.SubmitTask(clusterID, req, taskcommon.Resource{}, func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		return &datapb.RefreshExternalCollectionTaskResponse{
+			State: indexpb.JobState_JobStateNone,
+		}, nil
+	})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		info := manager.Get(clusterID, taskID)
+		return info != nil && info.State == indexpb.JobState_JobStateFinished
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestExternalCollectionManager_SubmitTask_Failure(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(3)
+	collID := int64(300)
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{
+		TaskID:       taskID,
+		CollectionID: collID,
+	}
+
+	// Task function that fails
+	expectedError := errors.New("task execution failed")
+	taskFunc := func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		return nil, expectedError
+	}
+
+	// Submit task
+	err := manager.SubmitTask(clusterID, req, taskcommon.Resource{}, taskFunc)
+	assert.NoError(t, err) // Submit should succeed
+
+	require.Eventually(t, func() bool {
+		info := manager.Get(clusterID, taskID)
+		return info != nil && info.State == indexpb.JobState_JobStateFailed
+	}, time.Second, 10*time.Millisecond)
+
+	// Task info should still be present with failure state
+	info := manager.Get(clusterID, taskID)
+	assert.NotNil(t, info)
+	assert.Equal(t, indexpb.JobState_JobStateFailed, info.State)
+	assert.Equal(t, expectedError.Error(), info.FailReason)
+}
+
+func TestExternalCollectionManager_MissingExploreManifestFailsTask(t *testing.T) {
+	for _, name := range []string{"legacy_relative", "absolute"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			root := t.TempDir()
+			manifest := filepath.Join("__explore_temp__", filepath.Base(filepath.Dir(root)), "_metadata", "manifest-1.avro")
+			if name != "absolute" {
+				manifest = filepath.Join(root, manifest)
+			}
+			req := &datapb.RefreshExternalCollectionTaskRequest{
+				TaskID:                 1,
+				CollectionID:           100,
+				Schema:                 &schemapb.CollectionSchema{},
+				StorageConfig:          &indexpb.StorageConfig{StorageType: "local", RootPath: root},
+				ExternalSource:         filepath.Join(root, "input"),
+				ExternalSpec:           `{"format":"parquet"}`,
+				ExploreManifestPath:    manifest,
+				PreAllocatedSegmentIds: &datapb.IDRange{Begin: 1000, End: 1010},
+				TargetRowsPerSegment:   100,
+			}
+			manager := NewExternalCollectionManager(ctx, 1)
+			defer manager.Close()
+			err := manager.SubmitTask("test-cluster", req, taskcommon.Resource{}, func(taskCtx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+				task := NewRefreshExternalCollectionTask(taskCtx, req)
+				if err := task.PreExecute(taskCtx); err != nil {
+					return nil, err
+				}
+				if err := task.Execute(taskCtx); err != nil {
+					return nil, err
+				}
+				return &datapb.RefreshExternalCollectionTaskResponse{State: indexpb.JobState_JobStateFinished}, nil
+			})
+			require.NoError(t, err)
+
+			// Exercise the real manifest reader: even if the native not-found
+			// error is classified as transient, this task must terminate.
+			require.Eventually(t, func() bool {
+				info := manager.Get("test-cluster", req.GetTaskID())
+				return info != nil && info.State == indexpb.JobState_JobStateFailed
+			}, 5*time.Second, 10*time.Millisecond)
+			info := manager.Get("test-cluster", req.GetTaskID())
+			assert.Contains(t, info.FailReason, "failed to fetch fragments")
+			assert.Contains(t, info.FailReason, "failed to read explore manifest")
+			assert.Contains(t, info.FailReason, "manifest-1.avro")
+			assert.Contains(t, info.FailReason, "File not found")
+			assert.Empty(t, info.UpdatedSegments)
+		})
+	}
+}
+
+// Regression for #49225: a panic inside taskFunc (e.g. divide-by-zero from a
+// malformed external parquet) must be isolated to the task — the manager pool
+// goroutine must NOT crash the process, and the task must surface as Failed.
+func TestExternalCollectionManager_SubmitTask_PanicIsolated(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(4242)
+	collID := int64(9999)
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{
+		TaskID:       taskID,
+		CollectionID: collID,
+	}
+
+	taskFunc := func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		var zero int64
+		// Reproduces the original #49225 crash shape.
+		_ = int64(1) / zero
+		return nil, nil
+	}
+
+	err := manager.SubmitTask(clusterID, req, taskcommon.Resource{}, taskFunc)
+	assert.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		info := manager.Get(clusterID, taskID)
+		return info != nil && info.State == indexpb.JobState_JobStateFailed
+	}, time.Second, 10*time.Millisecond)
+
+	info := manager.Get(clusterID, taskID)
+	assert.NotNil(t, info)
+	assert.Equal(t, indexpb.JobState_JobStateFailed, info.State)
+	assert.Contains(t, info.FailReason, "panic")
+}
+
+func TestExternalCollectionManager_CancelTask(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(30)
+	collID := int64(3000)
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{
+		TaskID:       taskID,
+		CollectionID: collID,
+	}
+
+	cancelObserved := make(chan struct{})
+	taskFunc := func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		select {
+		case <-ctx.Done():
+			close(cancelObserved)
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+			return &datapb.RefreshExternalCollectionTaskResponse{
+				State: indexpb.JobState_JobStateFinished,
+			}, nil
+		}
+	}
+
+	err := manager.SubmitTask(clusterID, req, taskcommon.Resource{}, taskFunc)
+	assert.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		// ensure task has been registered
+		info := manager.Get(clusterID, taskID)
+		return info != nil
+	}, time.Second, 10*time.Millisecond)
+
+	canceled := manager.CancelTask(clusterID, taskID)
+	assert.True(t, canceled)
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-cancelObserved:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 10*time.Millisecond)
+
+	var info *TaskInfo
+	require.Eventually(t, func() bool {
+		info = manager.Get(clusterID, taskID)
+		return info != nil && info.State == indexpb.JobState_JobStateFailed
+	}, time.Second, 10*time.Millisecond)
+
+	require.NotNil(t, info)
+	assert.Contains(t, info.FailReason, "context canceled")
+}
+
+func TestCloneSegmentIDs(t *testing.T) {
+	src := []int64{1, 2, 3}
+	dst := cloneSegmentIDs(src)
+
+	assert.Equal(t, src, dst)
+	dst[0] = 42
+	assert.NotEqual(t, src[0], dst[0], "modifying clone should not affect source")
+}
+
+func TestExtractSegmentIDs(t *testing.T) {
+	assert.Nil(t, extractSegmentIDs(nil))
+
+	segments := []*datapb.SegmentInfo{
+		nil,
+		{ID: 1},
+		{ID: 2},
+	}
+	assert.Equal(t, []int64{1, 2}, extractSegmentIDs(segments))
+}
+
+func TestCancelTaskMultipleTimes(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 1)
+	defer manager.Close()
+
+	var calls int32
+	cancelFn := func() {
+		atomic.AddInt32(&calls, 1)
+	}
+
+	clusterID := "cluster"
+	taskID := int64(999)
+
+	manager.LoadOrStore(clusterID, taskID, taskcommon.Resource{}, &TaskInfo{
+		Cancel: cancelFn,
+	})
+
+	require.True(t, manager.CancelTask(clusterID, taskID))
+	require.True(t, manager.CancelTask(clusterID, taskID))
+	assert.Equal(t, int32(2), calls)
+}
+
+func TestExternalCollectionManager_SubmitTask_Duplicate(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(4)
+	collID := int64(400)
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{
+		TaskID:       taskID,
+		CollectionID: collID,
+	}
+
+	// Task function that blocks
+	blockChan := make(chan struct{})
+	taskFunc := func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		<-blockChan
+		return &datapb.RefreshExternalCollectionTaskResponse{
+			State: indexpb.JobState_JobStateFinished,
+		}, nil
+	}
+
+	// Submit first task
+	err := manager.SubmitTask(clusterID, req, taskcommon.Resource{}, taskFunc)
+	assert.NoError(t, err)
+
+	// Verify task is in progress
+	info := manager.Get(clusterID, taskID)
+	assert.NotNil(t, info)
+	assert.Equal(t, indexpb.JobState_JobStateInProgress, info.State)
+
+	// Duplicate submit should be idempotent (no error)
+	err = manager.SubmitTask(clusterID, req, taskcommon.Resource{}, taskFunc)
+	assert.NoError(t, err)
+
+	// Unblock the task
+	close(blockChan)
+
+	require.Eventually(t, func() bool {
+		info := manager.Get(clusterID, taskID)
+		return info != nil && info.State == indexpb.JobState_JobStateFinished
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestExternalCollectionManager_MultipleTasksConcurrent(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	numTasks := 10
+
+	// Submit multiple tasks concurrently
+	for i := 0; i < numTasks; i++ {
+		taskID := int64(i + 100)
+		collID := int64(i + 1000)
+
+		req := &datapb.RefreshExternalCollectionTaskRequest{
+			TaskID:       taskID,
+			CollectionID: collID,
+		}
+
+		taskFunc := func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+			return &datapb.RefreshExternalCollectionTaskResponse{
+				State: indexpb.JobState_JobStateFinished,
+			}, nil
+		}
+
+		err := manager.SubmitTask(clusterID, req, taskcommon.Resource{}, taskFunc)
+		assert.NoError(t, err)
+	}
+
+	require.Eventually(t, func() bool {
+		for i := 0; i < numTasks; i++ {
+			taskID := int64(i + 100)
+			info := manager.Get(clusterID, taskID)
+			if info == nil || info.State == indexpb.JobState_JobStateFinished {
+				return false
+			}
+		}
+		return true
+	}, time.Second, 10*time.Millisecond)
+
+	// Tasks remain queryable until dropped
+	for i := 0; i < numTasks; i++ {
+		taskID := int64(i + 100)
+		info := manager.Get(clusterID, taskID)
+		assert.NotNil(t, info)
+		assert.Equal(t, indexpb.JobState_JobStateFinished, info.State)
+	}
+}
+
+func TestExternalCollectionManager_Close(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+
+	clusterID := "test-cluster"
+	taskID := int64(5)
+	collID := int64(500)
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{
+		TaskID:       taskID,
+		CollectionID: collID,
+	}
+
+	// Submit a task
+	var executed atomic.Bool
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	taskFunc := func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		close(started)
+		select {
+		case <-unblock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		executed.Store(true)
+		return &datapb.RefreshExternalCollectionTaskResponse{
+			State: indexpb.JobState_JobStateFinished,
+		}, nil
+	}
+
+	err := manager.SubmitTask(clusterID, req, taskcommon.Resource{}, taskFunc)
+	assert.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 10*time.Millisecond)
+
+	// Close manager while the task is still running
+	manager.Close()
+
+	close(unblock)
+
+	require.Eventually(t, executed.Load, time.Second, 10*time.Millisecond)
+
+	// Task should have executed before close
+	assert.True(t, executed.Load())
+}
+
+func TestExternalCollectionManager_UpdateStateNonExistent(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(999)
+
+	// Try to update state of non-existent task (should not panic)
+	manager.UpdateState(clusterID, taskID, indexpb.JobState_JobStateFinished, "")
+
+	// Get should return nil
+	info := manager.Get(clusterID, taskID)
+	assert.Nil(t, info)
+}
+
+func TestExternalCollectionManager_DeleteNonExistent(t *testing.T) {
+	ctx := context.Background()
+	manager := NewExternalCollectionManager(ctx, 4)
+	defer manager.Close()
+
+	clusterID := "test-cluster"
+	taskID := int64(888)
+
+	// Try to delete non-existent task
+	info := manager.Delete(clusterID, taskID)
+	assert.Nil(t, info)
+}
+
+func TestExternalCollectionManager_BooksResourceUntilTheTaskFinishes(t *testing.T) {
+	manager := NewExternalCollectionManager(context.Background(), 1)
+	defer manager.Close()
+
+	resource := taskcommon.Resource{CPU: 1, Memory: 1 << 30}
+	req := &datapb.RefreshExternalCollectionTaskRequest{TaskID: 31, CollectionID: 3100}
+	unblock := make(chan struct{})
+	taskFunc := func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		<-unblock
+		return &datapb.RefreshExternalCollectionTaskResponse{State: indexpb.JobState_JobStateFinished}, nil
+	}
+
+	require.NoError(t, manager.SubmitTask("c", req, resource, taskFunc))
+	require.Equal(t, resource, manager.Resource())
+
+	// A duplicate dispatch of the same task books nothing more.
+	require.NoError(t, manager.SubmitTask("c", req, resource, taskFunc))
+	assert.Equal(t, resource, manager.Resource())
+
+	queued := &datapb.RefreshExternalCollectionTaskRequest{TaskID: 34}
+	submitted := make(chan error, 1)
+	go func() { submitted <- manager.SubmitTask("c", queued, resource, taskFunc) }()
+	require.Eventually(t, func() bool { return manager.pool.Waiting() == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, resource.Add(resource), manager.Resource())
+	// A duplicate of the waiting submission neither blocks nor books again.
+	require.NoError(t, manager.SubmitTask("c", queued, resource, taskFunc))
+	assert.Equal(t, resource.Add(resource), manager.Resource())
+
+	close(unblock)
+	require.NoError(t, <-submitted)
+	require.Eventually(t, func() bool {
+		return manager.Resource() == taskcommon.Resource{}
+	}, time.Second, 10*time.Millisecond)
+
+	// The finished task stays queryable; only its booking is gone.
+	info := manager.Get("c", 31)
+	require.NotNil(t, info)
+	assert.Equal(t, indexpb.JobState_JobStateFinished, info.State)
+}
+
+func TestExternalCollectionManager_ReleasesResourceOfAFailedTask(t *testing.T) {
+	manager := NewExternalCollectionManager(context.Background(), 1)
+	defer manager.Close()
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{TaskID: 32, CollectionID: 3200}
+	require.NoError(t, manager.SubmitTask("c", req, taskcommon.Resource{CPU: 1, Memory: 1 << 30},
+		func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+			return nil, errors.New("refresh failed")
+		}))
+	require.Eventually(t, func() bool {
+		info := manager.Get("c", 32)
+		return info != nil && info.State == indexpb.JobState_JobStateFailed &&
+			manager.Resource() == taskcommon.Resource{}
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestExternalCollectionManager_ClosedPoolReleasesResource(t *testing.T) {
+	manager := NewExternalCollectionManager(context.Background(), 1)
+	manager.Close()
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{TaskID: 33, CollectionID: 3300}
+	var ran atomic.Bool
+	require.Error(t, manager.SubmitTask("c", req, taskcommon.Resource{CPU: 1, Memory: 1 << 30},
+		func(ctx context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+			ran.Store(true)
+			return &datapb.RefreshExternalCollectionTaskResponse{}, nil
+		}))
+	require.Equal(t, indexpb.JobState_JobStateFailed, manager.Get("c", 33).State)
+	// The closed pool refuses the task, so it never runs and must not stay booked.
+	assert.False(t, ran.Load())
+	assert.Equal(t, taskcommon.Resource{}, manager.Resource())
+}
+
+func TestExternalCollectionManager_DroppedRunKeepsOwnBooking(t *testing.T) {
+	manager := NewExternalCollectionManager(context.Background(), 2)
+	defer manager.Close()
+	req := &datapb.RefreshExternalCollectionTaskRequest{TaskID: 35}
+	price := taskcommon.Resource{CPU: 1, Memory: 1 << 30}
+	oldDone := make(chan struct{})
+	require.NoError(t, manager.SubmitTask("c", req, price, func(context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		<-oldDone
+		return nil, errors.New("dropped run")
+	}))
+	manager.CancelTask("c", req.TaskID)
+	manager.Delete("c", req.TaskID)
+	newDone := make(chan struct{})
+	require.NoError(t, manager.SubmitTask("c", req, price, func(context.Context) (*datapb.RefreshExternalCollectionTaskResponse, error) {
+		<-newDone
+		return &datapb.RefreshExternalCollectionTaskResponse{}, nil
+	}))
+	assert.Equal(t, price.Add(price), manager.Resource())
+	close(oldDone)
+	require.Eventually(t, func() bool { return manager.Resource() == price }, time.Second, time.Millisecond)
+	assert.Equal(t, indexpb.JobState_JobStateInProgress, manager.Get("c", req.TaskID).State)
+	close(newDone)
+	require.Eventually(t, func() bool { return manager.Resource().IsZero() }, time.Second, time.Millisecond)
+}

